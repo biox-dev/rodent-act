@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use rodent_act::{classify, draw, pipeline, pipeline::PipelineConfig, track, video_io};
 
@@ -130,9 +132,7 @@ enum Command {
     },
 
     /// Info about a video (resolution, fps, frame count).
-    Probe {
-        input: PathBuf,
-    },
+    Probe { input: PathBuf },
 
     /// Detect + track, then score 0.5 s immobility windows.
     Analyze {
@@ -203,6 +203,26 @@ enum Command {
         annotate: bool,
     },
 
+    /// Start the web UI (Axum API + React frontend) for interactive analysis.
+    Serve {
+        /// Address to bind.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+
+        /// Directory scanned for input videos (shown in the picker).
+        #[arg(long, default_value = "media")]
+        media_dir: PathBuf,
+
+        /// Directory for job outputs (frames, CSV, optional preview video).
+        #[arg(long, default_value = "out")]
+        out_dir: PathBuf,
+
+        /// Built frontend (Vite `dist`). Skipped when missing - use the dev
+        /// server (`npm run dev`, proxying /api here) instead.
+        #[arg(long, default_value = "frontend/dist")]
+        frontend: PathBuf,
+    },
+
     /// Write a PNG preview frame from an input video (no tracking).
     Snapshot {
         input: PathBuf,
@@ -226,6 +246,20 @@ fn parse_reference(spec: String) -> pipeline::Reference {
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // `serve` installs its own registry (fmt + SSE log layer) before any
+    // pipeline code logs, so it must not go through the CLI subscriber below.
+    if let Command::Serve {
+        addr,
+        media_dir,
+        out_dir,
+        frontend,
+    } = cli.command
+    {
+        return run_server(addr, media_dir, out_dir, frontend);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -234,7 +268,6 @@ fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    let cli = Cli::parse();
     match cli.command {
         Command::Track {
             input,
@@ -325,36 +358,36 @@ fn main() -> anyhow::Result<()> {
             max_frames,
             annotate,
         } => {
-            let cfg = pipeline::AnalyzeConfig {
-                track: PipelineConfig {
-                    input,
-                    output_video: annotate.then_some(output),
-                    output_json: None,
-                    output_csv: None,
-                    detector,
-                    model,
-                    max_side,
-                    blob_threshold,
-                    reference: reference.map(parse_reference),
-                    class_name,
-                    detect_every: 1,
-                    refresh_every: 90,
-                    tracker: track::TrackerConfig {
-                        min_hits,
-                        max_age,
-                        ..Default::default()
-                    },
-                    write_video: annotate,
-                    threads: 2,
-                    max_frames,
+            let track = PipelineConfig {
+                input,
+                output_video: annotate.then_some(output),
+                output_json: None,
+                output_csv: None,
+                detector,
+                model,
+                max_side,
+                blob_threshold,
+                reference: reference.map(parse_reference),
+                class_name,
+                detect_every: 1,
+                refresh_every: 90,
+                tracker: track::TrackerConfig {
+                    min_hits,
+                    max_age,
                     ..Default::default()
                 },
+                write_video: annotate,
+                threads: 2,
+                max_frames,
+                ..Default::default()
+            };
+            let analyze_cfg = pipeline::AnalyzeConfig {
                 classifier: clf,
                 window_s: window,
                 stride_s: stride.unwrap_or(window * 0.5),
-                output_csv: windows,
             };
-            let report = pipeline::analyze(&cfg)?;
+            let report = pipeline::analyze(&track, &analyze_cfg)?;
+            pipeline::write_window_csv(&windows, &report.feature_names, &report.windows)?;
             println!(
                 "tracks={} windows={} immobile_windows={} mean_immobile_prob={:.3}",
                 report.n_tracks,
@@ -370,6 +403,7 @@ fn main() -> anyhow::Result<()> {
                 println!("  track {id}: immobile {:.1}%", frac * 100.0);
             }
         }
+        Command::Serve { .. } => unreachable!("handled before the CLI subscriber"),
         Command::Snapshot {
             input,
             frame,
@@ -393,4 +427,43 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Start the Axum server (web UI). Installs the log layer *before* any
+/// pipeline code runs, so the browser receives every tracing event.
+fn run_server(
+    addr: String,
+    media_dir: PathBuf,
+    out_dir: PathBuf,
+    frontend: PathBuf,
+) -> anyhow::Result<()> {
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --addr `{addr}`: {e}"))?;
+    let (log_tx, _) = tokio::sync::broadcast::channel(1024);
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ort=warn")))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .compact(),
+        )
+        .with(rodent_act::web::telemetry::SseLayer::new(
+            log_tx.clone(),
+            tracing::Level::INFO,
+        ))
+        .init();
+
+    std::fs::create_dir_all(&out_dir).ok();
+
+    let state = rodent_act::web::AppState {
+        jobs: std::sync::Arc::new(rodent_act::web::JobManager::new(out_dir, media_dir)),
+        log_tx,
+    };
+    let frontend = frontend.exists().then_some(frontend);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(rodent_act::web::serve(addr, state, frontend))
 }

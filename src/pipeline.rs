@@ -12,8 +12,8 @@ use tracing::{info, warn};
 
 use crate::common::{Bbox, Detection};
 use crate::detect::blob::BlobDetector;
-use crate::detect::{COCO_NAMES, YoloDetector};
 use crate::detect::motion::MotionTrigger;
+use crate::detect::{COCO_NAMES, YoloDetector};
 use crate::draw::{self, DrawTrack, FrameOverlay};
 use crate::preprocess::LetterboxCfg;
 use crate::track::{MultiTracker, TrackerConfig};
@@ -142,8 +142,44 @@ pub struct PipelineStats {
     pub elapsed_s: f64,
 }
 
+/// One decoded (and optionally annotated) frame handed to a [`FrameHook`].
+pub struct FrameView<'a> {
+    pub index: usize,
+    /// Timestamp in seconds.
+    pub t: f64,
+    pub fps: f64,
+    pub width: u32,
+    pub height: u32,
+    /// Annotated RGB buffer when the caller asked for annotation.
+    pub overlay: Option<&'a [u8]>,
+    /// Decoded frame count (unknown for some containers).
+    pub total_frames: Option<usize>,
+}
+
+/// Optional observer called once per decoded frame.
+///
+/// The callback runs on the pipeline thread, so it must be cheap: hand the data
+/// to a channel or a worker rather than blocking here.
+pub trait FrameHook: Send {
+    fn on_frame(&mut self, frame: &FrameView<'_>);
+
+    /// Return `true` to stop the pipeline after the current frame
+    /// (used by the web UI's cancel button). Defaults to never stopping.
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
 /// Run the whole pipeline and report what happened.
 pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
+    run_with_hook(cfg, None)
+}
+
+/// [`run`] variant used by the web server to stream frames to the browser.
+pub fn run_with_hook(
+    cfg: &PipelineConfig,
+    mut hook: Option<&mut dyn FrameHook>,
+) -> Result<RunInfo> {
     let started = Instant::now();
     let mut reader = VideoReader::open(&cfg.input, cfg.max_side)?;
     let (w, h) = (reader.width, reader.height);
@@ -172,7 +208,11 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
         );
         Some((d, want))
     } else {
-        info!(backend = "blob", threshold = cfg.blob_threshold, "detector ready");
+        info!(
+            backend = "blob",
+            threshold = cfg.blob_threshold,
+            "detector ready"
+        );
         None
     };
     // `usize::MAX` = accept every class (blob backend and `--class-name any`).
@@ -184,10 +224,7 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
 
     // The network input size comes from the ONNX graph (Ultralytics exports a
     // static shape = the `imgsz` used at export time), falling back to 640.
-    let (net_w, net_h) = yolo
-        .as_ref()
-        .map(|(d, _)| d.net_wh())
-        .unwrap_or((640, 640));
+    let (net_w, net_h) = yolo.as_ref().map(|(d, _)| d.net_wh()).unwrap_or((640, 640));
     let lb = LetterboxCfg::new(w, h, net_w, net_h);
     if cfg.detector == DetectorKind::Yolo {
         info!(net_w, net_h, "network input size");
@@ -212,7 +249,10 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
                     b.set_reference(&f.data);
                     info!(frame = idx, "using empty-enclosure reference frame");
                 } else {
-                    warn!(frame = idx, "reference frame beyond end of video; falling back to temporal background");
+                    warn!(
+                        frame = idx,
+                        "reference frame beyond end of video; falling back to temporal background"
+                    );
                 }
             }
             Reference::Image(path) => {
@@ -257,15 +297,27 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
     let mut n_detections = 0usize;
     let mut frame_count = 0usize;
     let mut summary: HashMap<usize, TrackSummary> = HashMap::new();
+    // Hook consumers want a percentage, which needs the decoded frame total:
+    // the smallest of the requested cap and the container's frame count.
+    let total_frames = match (cfg.max_frames, reader.n_frames_est) {
+        (Some(cap), est) if est > 0 => Some(cap.min(est)),
+        (Some(cap), _) => Some(cap),
+        (None, est) if est > 0 => Some(est),
+        _ => None,
+    };
 
     // Keep only tracks of the requested class in the output.
     let mut first_refresh_done = false;
 
     while let Some(mut frame) = reader.next_frame()? {
-        if let Some(max) = cfg.max_frames {
-            if frame.index >= max {
-                break;
-            }
+        if let Some(max) = cfg.max_frames
+            && frame.index >= max
+        {
+            break;
+        }
+        if hook.as_ref().is_some_and(|h| h.cancelled()) {
+            info!(frame = frame.index, "pipeline cancelled by caller");
+            break;
         }
         frame_count += 1;
         pb.inc(1);
@@ -313,8 +365,7 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
                 unreachable!("yolo backend without a detector")
             };
             if moving && !rois.is_empty() && cfg.defer_features_only_on_roi() {
-                detections =
-                    detect_in_rois(detector, &frame.data, w, h, &lb, &rois, want_class)?;
+                detections = detect_in_rois(detector, &frame.data, w, h, &lb, &rois, want_class)?;
             } else {
                 // full-frame detection: exact, used for periodic refresh
                 full_dets = detector.detect(&frame.data, &lb)?;
@@ -324,8 +375,7 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
 
             // Generic COCO models rarely fire `mouse` on lab footage; if the
             // first full-frame pass finds nothing, widen to animal classes.
-            let is_full_frame =
-                !(moving && !rois.is_empty() && cfg.defer_features_only_on_roi());
+            let is_full_frame = !(moving && !rois.is_empty() && cfg.defer_features_only_on_roi());
             if is_full_frame && !first_refresh_done {
                 first_refresh_done = true;
                 if detections.is_empty()
@@ -379,6 +429,19 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
 
         if let Some(wtr) = writer.as_mut() {
             wtr.write_frame(&frame.data)?;
+        }
+
+        // --- 4b. stream the annotated frame to observers (web UI) -----------
+        if let Some(obs) = hook.as_mut() {
+            obs.on_frame(&FrameView {
+                index: frame.index,
+                t: frame.index as f64 / fps,
+                fps,
+                width: w,
+                height: h,
+                overlay: Some(&frame.data),
+                total_frames,
+            });
         }
 
         // --- 5. bookkeeping -------------------------------------------------
@@ -568,7 +631,11 @@ fn mask_ratio_in(bd: &BlobDetector, b: &Bbox, frame_w: u32, frame_h: u32) -> f32
             }
         }
     }
-    if total == 0 { 0.0 } else { on as f32 / total as f32 }
+    if total == 0 {
+        0.0
+    } else {
+        on as f32 / total as f32
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -577,12 +644,20 @@ fn mask_ratio_in(bd: &BlobDetector, b: &Bbox, frame_w: u32, frame_h: u32) -> f32
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeConfig {
-    pub track: PipelineConfig,
     /// Optional XGBoost JSON model; a speed-threshold baseline otherwise.
     pub classifier: Option<PathBuf>,
     pub window_s: f64,
     pub stride_s: f64,
-    pub output_csv: PathBuf,
+}
+
+impl Default for AnalyzeConfig {
+    fn default() -> Self {
+        Self {
+            classifier: None,
+            window_s: crate::features::DEFAULT_WINDOW_S,
+            stride_s: crate::features::DEFAULT_WINDOW_S * 0.5,
+        }
+    }
 }
 
 /// One scored window.
@@ -611,9 +686,16 @@ pub struct AnalyzeReport {
 }
 
 /// Run tracking, then score every window of every track.
-pub fn analyze(cfg: &AnalyzeConfig) -> Result<AnalyzeReport> {
-    let info = run(&cfg.track)?;
+///
+/// Thin wrapper around [`score_tracks`] for the CLI; the web server uses the
+/// split form because it also needs the per-frame records for the UI.
+pub fn analyze(cfg: &PipelineConfig, analyze_cfg: &AnalyzeConfig) -> Result<AnalyzeReport> {
+    let info = run(cfg)?;
+    score_tracks(&info, analyze_cfg)
+}
 
+/// Score 0.5 s windows from an already-computed tracking run.
+pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport> {
     let fps = info.fps;
     let (frame_w, frame_h) = (info.width, info.height);
 
@@ -717,8 +799,6 @@ pub fn analyze(cfg: &AnalyzeConfig) -> Result<AnalyzeReport> {
         windows.iter().map(|w| w.immobile_prob).sum::<f32>() / windows.len() as f32
     };
 
-    write_window_csv(&cfg.output_csv, &names, &windows)?;
-
     Ok(AnalyzeReport {
         n_tracks: by_track.len(),
         feature_names: names,
@@ -728,13 +808,17 @@ pub fn analyze(cfg: &AnalyzeConfig) -> Result<AnalyzeReport> {
     })
 }
 
-fn write_window_csv(path: &Path, names: &[String], windows: &[ScoredWindow]) -> Result<()> {
+/// Write a scored report as CSV (one row per window).
+pub fn write_window_csv(path: &Path, names: &[String], windows: &[ScoredWindow]) -> Result<()> {
     use std::io::Write as _;
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).ok();
     }
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    write!(f, "track_id,start_frame,end_frame,start_t,end_t,immobile_prob,label,rii")?;
+    write!(
+        f,
+        "track_id,start_frame,end_frame,start_t,end_t,immobile_prob,label,rii"
+    )?;
     for n in names {
         write!(f, ",{n}")?;
     }

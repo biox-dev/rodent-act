@@ -5,3 +5,8 @@ TST.mp4
 /models
 /dataset
 /runs
+
+# frontend deps + build output
+frontend/node_modules
+frontend/dist
+frontend/tsconfig.tsbuildinfo

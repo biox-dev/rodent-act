@@ -1,0 +1,808 @@
+//! Axum router: REST API, SSE streams and (optionally) the built SPA.
+
+use std::convert::Infallible;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::Context;
+use axum::body::Body;
+use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use futures::Stream;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use tower_http::cors::CorsLayer;
+
+use crate::pipeline::{AnalyzeConfig, DetectorKind, PipelineConfig, Reference};
+use crate::track::TrackerConfig;
+use crate::web::state::{self, Job, JobManager, JobStatus, JobView};
+use crate::web::telemetry::{self, LogRecord};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub jobs: Arc<JobManager>,
+    pub log_tx: broadcast::Sender<LogRecord>,
+}
+
+// --------------------------------------------------------------------------- //
+// request / response DTOs
+// --------------------------------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateJob {
+    /// File name inside the media directory (see `/api/media`).
+    pub media: String,
+    #[serde(default)]
+    pub detector: Option<String>,
+    /// Empty-enclosure reference: `empty_ref.png`, `frame:0`, or omitted.
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub blob_threshold: Option<u8>,
+    #[serde(default)]
+    pub blob_min_area: Option<f32>,
+    #[serde(default)]
+    pub max_side: Option<u32>,
+    #[serde(default)]
+    pub min_hits: Option<usize>,
+    #[serde(default)]
+    pub max_age: Option<usize>,
+    #[serde(default)]
+    pub max_frames: Option<usize>,
+    #[serde(default)]
+    pub score_thr: Option<f32>,
+    #[serde(default)]
+    pub class_name: Option<String>,
+    /// Model path relative to the working directory (YOLO backend).
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub window: Option<f64>,
+    #[serde(default)]
+    pub stride: Option<f64>,
+    #[serde(default)]
+    pub clf: Option<String>,
+    /// Write an H.264 preview next to the frames (extra ffmpeg pass).
+    #[serde(default)]
+    pub write_video: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct MediaFile {
+    name: String,
+    size: u64,
+    modified_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn api_error(code: StatusCode, msg: impl Into<String>) -> Response {
+    (code, Json(serde_json::json!({ "error": msg.into() }))).into_response()
+}
+
+/// Output of `/api/info`, mirroring what the CLI can do.
+#[derive(Serialize)]
+struct ServerInfo {
+    version: &'static str,
+    media_dir: String,
+    out_dir: String,
+    ffmpeg: bool,
+    features: Vec<String>,
+    default_window_s: f64,
+}
+
+/// Resolve a user-supplied file name inside `dir`, refusing path traversal.
+fn safe_join(dir: &Path, name: &str) -> Option<PathBuf> {
+    let candidate = Path::new(name);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let joined = dir.join(candidate);
+    joined.starts_with(dir).then_some(joined)
+}
+
+fn has_ffmpeg() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// --------------------------------------------------------------------------- //
+// handlers
+// --------------------------------------------------------------------------- //
+
+async fn info(State(st): State<AppState>) -> Json<ServerInfo> {
+    Json(ServerInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        media_dir: st.jobs.media_dir().display().to_string(),
+        out_dir: st.jobs.out_dir().display().to_string(),
+        ffmpeg: has_ffmpeg(),
+        features: crate::features::FEATURE_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        default_window_s: crate::features::DEFAULT_WINDOW_S,
+    })
+}
+
+async fn list_media(State(st): State<AppState>) -> Json<Vec<MediaFile>> {
+    let dir = st.jobs.media_dir().to_path_buf();
+    let mut files = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !matches!(
+                ext.as_str(),
+                "mp4" | "avi" | "mov" | "mkv" | "webm" | "png" | "jpg"
+            ) {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            files.push(MediaFile {
+                name: entry.file_name().to_string_lossy().to_string(),
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                modified_ms: meta
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            });
+        }
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.modified_ms));
+    Json(files)
+}
+
+/// Serve a media file with HTTP range support (needed for `<video>` seeking).
+async fn media_file(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(path) = safe_join(st.jobs.media_dir(), &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid media name");
+    };
+    serve_file_range(&path, &headers).await
+}
+
+async fn job_video(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    let path = job
+        .video
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default();
+    serve_file_range(&path, &headers).await
+}
+
+/// Minimal range-aware file responder (single `bytes=start-end` range).
+async fn serve_file_range(path: &Path, headers: &axum::http::HeaderMap) -> Response {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return api_error(StatusCode::NOT_FOUND, "file not found");
+    };
+    let len = meta.len();
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    };
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range);
+
+    let build = |status: StatusCode, start: u64, end: u64| -> Response {
+        let mut resp = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, mime)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_LENGTH, (end - start + 1).to_string());
+        if status == StatusCode::PARTIAL_CONTENT {
+            resp = resp.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+        }
+        let body = file_stream(path.to_path_buf(), start, end);
+        resp.body(Body::from_stream(body))
+            .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "body error"))
+    };
+
+    match range {
+        Some((start, end)) if start < len => {
+            let end = end.min(len - 1);
+            build(StatusCode::PARTIAL_CONTENT, start, end)
+        }
+        Some(_) => api_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            format!("range outside file (len {len})"),
+        ),
+        None => build(StatusCode::OK, 0, len.saturating_sub(1)),
+    }
+}
+
+fn file_stream(
+    path: PathBuf,
+    start: u64,
+    end: u64,
+) -> impl Stream<Item = std::io::Result<axum::body::Bytes>> + Send + 'static {
+    async_stream::stream! {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut f = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
+        if f.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+            return;
+        }
+        let mut left = end - start + 1;
+        let mut buf = vec![0u8; 64 * 1024];
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            match f.read(&mut buf[..want]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    left -= n as u64;
+                    yield Ok(axum::body::Bytes::copy_from_slice(&buf[..n]));
+                }
+                Err(e) => {
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Parse `bytes=0-1023` / `bytes=-1024` / `bytes=1024-`.
+fn parse_range(value: &str) -> Option<(u64, u64)> {
+    let spec = value.strip_prefix("bytes=")?;
+    let (a, b) = spec.split_once('-')?;
+    match (a.trim(), b.trim()) {
+        ("", "") => None,
+        ("", suffix) => {
+            let n: u64 = suffix.parse().ok()?;
+            Some((u64::MAX.saturating_sub(n - 1), u64::MAX))
+        }
+        (start, "") => Some((start.parse().ok()?, u64::MAX)),
+        (start, end) => Some((start.parse().ok()?, end.parse().ok()?)),
+    }
+}
+
+async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> Response {
+    let Some(input) = safe_join(st.jobs.media_dir(), &req.media) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid media name");
+    };
+    if !input.exists() {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("media file not found: {}", req.media),
+        );
+    }
+
+    let id = format!("j{}-{:04x}", now_ms(), rand_suffix());
+    let job_dir = st.jobs.job_dir(&id);
+    if let Err(e) = std::fs::create_dir_all(&job_dir) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot create job dir: {e}"),
+        );
+    }
+
+    let detector = match req.detector.as_deref() {
+        None | Some("blob") => DetectorKind::Blob,
+        Some("yolo") => DetectorKind::Yolo,
+        Some(other) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown detector `{other}` (use blob|yolo)"),
+            );
+        }
+    };
+    let reference = req.reference.as_deref().and_then(|spec| {
+        if let Some(idx) = spec.strip_prefix("frame:") {
+            idx.trim().parse::<usize>().ok().map(Reference::Frame)
+        } else if spec.is_empty() {
+            None
+        } else {
+            safe_join(st.jobs.media_dir(), spec).map(Reference::Image)
+        }
+    });
+
+    let window = req
+        .window
+        .unwrap_or(crate::features::DEFAULT_WINDOW_S)
+        .clamp(0.1, 10.0);
+    let video_path = req
+        .write_video
+        .unwrap_or(false)
+        .then(|| job_dir.join("annotated.mp4"));
+
+    let cfg = PipelineConfig {
+        input: input.clone(),
+        output_video: video_path,
+        output_json: None,
+        output_csv: None,
+        detector,
+        model: req
+            .model
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("models/yolo11n.onnx")),
+        max_side: req.max_side.unwrap_or(640).clamp(160, 1920),
+        score_thr: req.score_thr.unwrap_or(0.2),
+        iou_thr: 0.45,
+        blob_threshold: req.blob_threshold.unwrap_or(22),
+        blob_min_area: req.blob_min_area.unwrap_or(0.0015),
+        reference,
+        class_name: req.class_name.unwrap_or_else(|| "mouse".to_string()),
+        fallback_animal: true,
+        detect_every: 1,
+        refresh_every: 90,
+        tracker: TrackerConfig {
+            min_hits: req.min_hits.unwrap_or(5).max(1),
+            max_age: req.max_age.unwrap_or(30).max(1),
+            ..Default::default()
+        },
+        write_video: req.write_video.unwrap_or(false),
+        show_rois: false,
+        show_trails: true,
+        threads: 2,
+        max_frames: req.max_frames.filter(|n| *n > 0),
+        preview_every: None,
+    };
+    let analyze_cfg = AnalyzeConfig {
+        classifier: req.clf.filter(|s| !s.is_empty()).map(PathBuf::from),
+        window_s: window,
+        stride_s: req.stride.unwrap_or(window * 0.5).max(0.05),
+    };
+
+    let (finished_tx, _) = tokio::sync::watch::channel(false);
+    let (log_tx, _) = broadcast::channel(256);
+    let job = Arc::new(Job {
+        id: id.clone(),
+        input_name: req.media.clone(),
+        input,
+        status: std::sync::RwLock::new(JobStatus::Queued),
+        error: std::sync::RwLock::new(None),
+        created_ms: now_ms(),
+        frames_done: std::sync::RwLock::new(0),
+        total_frames: std::sync::RwLock::new(0),
+        run: std::sync::RwLock::new(None),
+        report: std::sync::RwLock::new(None),
+        video: std::sync::RwLock::new(None),
+        frames: Arc::new(state::FrameBus::new(15.0, 72)),
+        logs: Arc::new(std::sync::RwLock::new(Vec::new())),
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        finished: finished_tx,
+        duration_s: std::sync::RwLock::new(None),
+    });
+    st.jobs.insert(job.clone());
+
+    // Bridge pipeline logs into the per-job buffer + live SSE stream.
+    let mut log_rx = st.log_tx.subscribe();
+    let job_logs = job.logs.clone();
+    let job_log_tx = log_tx.clone();
+    tokio::spawn(async move {
+        while let Ok(rec) = log_rx.recv().await {
+            if let Ok(mut buf) = job_logs.write() {
+                if buf.len() >= 2000 {
+                    buf.drain(..500);
+                }
+                buf.push(rec.clone());
+            }
+            let _ = job_log_tx.send(rec);
+        }
+    });
+
+    let csv_path = job_dir.join("windows.csv");
+    let worker_job = job.clone();
+    let job_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = state::execute(worker_job.clone(), cfg, analyze_cfg, csv_path) {
+            state::fail(&worker_job, &e);
+        }
+    });
+
+    tracing::info!(job = %job_id, media = %req.media, "analysis job queued");
+    (StatusCode::CREATED, Json(job.view())).into_response()
+}
+
+fn rand_suffix() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(now_ms());
+    (h.finish() & 0xffff) as u16
+}
+
+async fn list_jobs(State(st): State<AppState>) -> Json<Vec<JobView>> {
+    Json(st.jobs.list().iter().map(|j| j.view()).collect())
+}
+
+async fn get_job(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    match st.jobs.get(&id) {
+        Some(job) => Json(job.view()).into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "unknown job"),
+    }
+}
+
+async fn cancel_job(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    if !job.status().is_terminal() {
+        job.cancel.store(true, Ordering::Relaxed);
+        job.set_status(JobStatus::Cancelled);
+        let _ = job.finished.send(true);
+    }
+    Json(job.view()).into_response()
+}
+
+/// Per-frame tracking records (boxes for every frame of every track).
+///
+/// The UI uses these to draw an overlay that follows the video element, so
+/// boxes stay visible even for previously downloaded videos.
+async fn job_records(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    let run = job.run.read().ok().and_then(|g| g.clone());
+    let Some(run) = run else {
+        return api_error(StatusCode::CONFLICT, "job still tracking");
+    };
+    Json(serde_json::json!({
+        "width": run.width,
+        "height": run.height,
+        "fps": run.fps,
+        "frames": run.frames,
+        "tracks": run.tracks,
+        "records": run.records,
+    }))
+    .into_response()
+}
+
+async fn job_windows(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    let report = job.report.read().ok().and_then(|g| g.clone());
+    match report {
+        Some(report) => Json(serde_json::json!({
+            "feature_names": report.feature_names,
+            "mean_immobile_prob": report.mean_immobile_prob,
+            "per_track_immobile_fraction": report.per_track_immobile_fraction,
+            "windows": report.windows,
+        }))
+        .into_response(),
+        None => api_error(StatusCode::CONFLICT, "job still running"),
+    }
+}
+
+async fn job_logs(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<LogQuery>,
+) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    let since = q.since.unwrap_or(0);
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    let logs = job.logs.read().ok();
+    let mut records: Vec<LogRecord> = logs
+        .as_ref()
+        .map(|g| g.iter().skip(since).cloned().collect())
+        .unwrap_or_default();
+    let total = since + records.len();
+    if records.len() > limit {
+        let drop = records.len() - limit;
+        records.drain(..drop);
+    }
+    let next = total;
+    Json(serde_json::json!({ "total": total, "next": next, "records": records })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct LogQuery {
+    since: Option<usize>,
+    limit: Option<usize>,
+}
+
+// ------------------------------- SSE: status ------------------------------- //
+
+async fn job_events(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    // Subscribe *before* building the initial snapshot so no update is lost.
+    let mut log_rx = st.log_tx.subscribe();
+    let mut finished_rx = job.finished.subscribe();
+
+    let initial_logs: Vec<LogRecord> = job
+        .logs
+        .read()
+        .map(|g| g.iter().cloned().collect())
+        .unwrap_or_default();
+    let job_for_poll = job.clone();
+
+    let stream = async_stream::stream! {
+        for rec in initial_logs {
+            yield Ok::<Event, Infallible>(telemetry::log_event(&rec));
+        }
+        yield Ok(telemetry::status_event(status_name(job_for_poll.status())));
+        if job_for_poll.status().is_terminal() {
+            yield Ok(Event::default().event("done").data("{}"));
+            return;
+        }
+
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                biased;
+                rec = log_rx.recv() => {
+                    match rec {
+                        Ok(rec) => {
+                            yield Ok(telemetry::log_event(&rec));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+                changed = finished_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    yield Ok(telemetry::status_event(status_name(job_for_poll.status())));
+                    yield Ok(Event::default().event("done").data("{}"));
+                    return;
+                }
+                _ = ticker.tick() => {
+                    let (done, total) = {
+                        let d = job_for_poll.frames_done.read().map(|g| *g).unwrap_or(0);
+                        let t = job_for_poll.total_frames.read().map(|g| *g).unwrap_or(0);
+                        (d, t)
+                    };
+                    if total > 0 {
+                        yield Ok(telemetry::progress_event(
+                            done as f64 / total as f64,
+                            &format!("{done}/{total} frames"),
+                        ));
+                    }
+                    if job_for_poll.status().is_terminal() {
+                        yield Ok(telemetry::status_event(status_name(job_for_poll.status())));
+                        yield Ok(Event::default().event("done").data("{}"));
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+fn status_name(s: JobStatus) -> &'static str {
+    match s {
+        JobStatus::Queued => "queued",
+        JobStatus::Running => "running",
+        JobStatus::Done => "done",
+        JobStatus::Failed => "failed",
+        JobStatus::Cancelled => "cancelled",
+    }
+}
+
+// ------------------------------- SSE: frames ------------------------------- //
+
+/// Latest annotated frame (JPEG). 204 when no frame was published yet.
+async fn latest_frame(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    match job.frames.last() {
+        Some(p) => jpeg_response(&p.jpeg, &p.meta),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+fn jpeg_response(bytes: &[u8], meta: &state::FrameMeta) -> Response {
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "no-store");
+    if let Ok(v) = HeaderValue::from_str(&meta.index.to_string()) {
+        resp = resp.header("X-Frame-Index", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&format!("{:.4}", meta.t)) {
+        resp = resp.header("X-Frame-Time", v);
+    }
+    resp.body(Body::from(bytes.to_vec()))
+        .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "body error"))
+}
+
+/// Live frame stream. Each SSE `data:` is base64-encoded JPEG.
+async fn frame_stream(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    let job_frames = job.frames.clone();
+    let job_poll = job.clone();
+
+    let stream = async_stream::stream! {
+        // Attach from *inside* the future: the handler is dropped as soon as
+        // the body is handed to hyper, but this stream lives for the whole
+        // connection. While attached, the pipeline encodes annotated frames.
+        let _viewer = job_frames.attach();
+        let mut rx = job_frames.subscribe();
+        let frame_event = |packet: &state::FramePacket| {
+            let b64 = base64_encode(&packet.jpeg);
+            Ok::<Event, Infallible>(
+                Event::default()
+                    .event("frame")
+                    .data(format!(
+                        "{{\"index\":{},\"t\":{:.4},\"total\":{},\"jpeg\":\"{}\"}}",
+                        packet.meta.index, packet.meta.t, packet.meta.total, b64
+                    )),
+            )
+        };
+        // Seed with the most recent frame: the pipeline may already have
+        // dropped frames for this viewer, and a `<img>` needs one immediately.
+        if let Some(last) = job_frames.last() {
+            yield frame_event(&last);
+        }
+        loop {
+            match rx.recv().await {
+                Ok(packet) => yield frame_event(&packet),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+            if job_poll.status().is_terminal() && job_poll.frames.last().is_none() {
+                break;
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+/// Small, dependency-free base64 encoder (RFC 4648, no line breaks).
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+// --------------------------------------------------------------------------- //
+// router
+// --------------------------------------------------------------------------- //
+
+pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
+    let api = Router::new()
+        .route("/info", get(info))
+        .route("/media", get(list_media))
+        .route("/media/{name}", get(media_file))
+        .route("/jobs", get(list_jobs).post(create_job))
+        .route("/jobs/{id}", get(get_job).delete(cancel_job))
+        .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs/{id}/events", get(job_events))
+        .route("/jobs/{id}/frame", get(latest_frame))
+        .route("/jobs/{id}/frames", get(frame_stream))
+        .route("/jobs/{id}/records", get(job_records))
+        .route("/jobs/{id}/windows", get(job_windows))
+        .route("/jobs/{id}/logs", get(job_logs))
+        .route("/jobs/{id}/video", get(job_video))
+        .with_state(state);
+
+    let mut app = Router::new().nest("/api", api);
+
+    if let Some(dist) = frontend_dist {
+        let index = dist.join("index.html");
+        if index.exists() {
+            tracing::info!(path = %dist.display(), "serving frontend build");
+            let static_files = tower_http::services::ServeDir::new(dist)
+                .append_index_html_on_directories(true)
+                .fallback(axum::routing::any_service(
+                    tower_http::services::ServeFile::new(index),
+                ));
+            app = app
+                .nest_service(
+                    "/assets",
+                    tower_http::services::ServeDir::new(dist.join("assets")),
+                )
+                // Client-side routes (React Router) fall back to index.html.
+                .fallback_service(static_files);
+        } else {
+            tracing::warn!(
+                path = %index.display(),
+                "frontend build missing - run `npm --prefix frontend install && npm --prefix frontend run build`"
+            );
+        }
+    }
+
+    app.layer(
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any),
+    )
+}
+
+/// Start the HTTP server (blocking until shutdown).
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    state: AppState,
+    frontend_dist: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let app = router(state, frontend_dist.as_deref());
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    tracing::info!("listening on http://{addr}");
+    axum::serve(listener, app).await.context("axum server")?;
+    Ok(())
+}

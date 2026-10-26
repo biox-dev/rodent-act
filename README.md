@@ -39,6 +39,9 @@ cp onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0 models/libonnxrunti
 ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act track \
   -i media/mouse_cage_20s.mp4 --detector yolo --class-name any \
   -o out/yolo_tracked.mp4 --json out/yolo_tracks.json
+
+# 6) 浏览器可视化界面（实时标注帧 + 窗口时间轴，见 2.5 节）
+(cd frontend && npm install && npm run build) && ./target/release/rodent-act serve
 ```
 
 `out/tracked.mp4` 是可以直接播放/预览的标注视频：每个目标一个固定颜色的
@@ -83,7 +86,73 @@ ffmpeg (子进程)              (Rust)
 | `src/draw.rs` | 纯 RGB 缓冲区绘框/轨迹/文字（内置 5×7 点阵字体）、PNG/ASCII 预览 |
 | `src/features.rs` | 0.5 s 窗口特征（骨架已就位，见第 5 节） |
 | `src/classify.rs` | XGBoost 接口（骨架已就位，见第 5 节） |
-| `src/pipeline.rs` | 端到端流水线 + 统计 + JSON/CSV 导出 |
+| `src/pipeline.rs` | 端到端流水线 + 统计 + JSON/CSV 导出 + `FrameHook` 逐帧回调 |
+| `src/web/` | **Axum 服务**：REST + SSE（日志/进度/标注帧）+ 前端静态托管 |
+| `frontend/` | **React + Vite UI**：选片 → 跑分析 → 实时看标注帧 → 回放 + 时间轴 + 曲线 |
+
+---
+
+## 2.5 可视化 Web UI（Axum + React）
+
+除了 CLI，还有一个浏览器界面：选视频 → 后台跑分析 → **实时看到标注帧** →
+完成后在任意视频播放器上叠加检测框，并查看 0.5 s 窗口时间轴与特征曲线。
+
+```bash
+# ① 编译前端（只需一次，改了前端再跑一次）
+cd frontend && npm install && npm run build && cd ..
+
+# ② 编译并启动（默认 http://127.0.0.1:8080）
+ ORT_DYLIB_PATH=models/libonnxruntime.so cargo run --release -- serve
+#    ├── --addr 0.0.0.0:8080      绑定的地址
+#    ├── --media-dir media        视频选择器扫描的目录
+#    ├── --out-dir out            job 输出（CSV / 可选 mp4）
+#    └── --frontend frontend/dist 前端构建产物；缺失时只提供 API
+```
+
+### 前端开发模式（热更新）
+
+```bash
+cargo run --release -- serve            # 终端 A：后端 :8080
+cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代理到 8080
+```
+
+### 页面
+
+| 路由 | 内容 |
+|---|---|
+| `/` | 选择视频 + 参数（检测后端、空场参考、bob 阈值、min_hits、窗口长度、XGB 模型） |
+| `/jobs` | 任务列表：状态、进度、轨迹数、不动比例、耗时（每 3 s 刷新） |
+| `/jobs/:id` | 运行中：SSE 标注帧流 + 进度条 + 实时日志；完成后：视频 + 检测框叠加（Canvas）、窗口时间轴（点击跳转）、`p(immobile)` 曲线、任意特征曲线、每条轨迹统计、窗口明细表 |
+
+### API
+
+所有接口在 `/api` 下，SSE 端点用 `EventSource` 订阅：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/info` | 版本、目录、ffmpeg 可用性、特征名 |
+| `GET` | `/media` | 媒体目录中的视频/图片 |
+| `GET` | `/media/{name}` | 支持 `Range` 的视频流（`<video>` 拖动所需） |
+| `POST` | `/jobs` | 创建任务 `{"media": "...", "detector": "blob", "reference": "empty_ref.png", ...}` |
+| `GET` | `/jobs` / `/jobs/{id}` | 任务列表 / 详情（含 summary） |
+| `POST` | `/jobs/{id}/cancel` | 取消运行中的任务 |
+| `GET` | `/jobs/{id}/events` | **SSE**：`log` / `progress` / `status` / `done` |
+| `GET` | `/jobs/{id}/frames` | **SSE**：标注帧，`data` 为 base64 JPEG |
+| `GET` | `/jobs/{id}/frame` | 最新一帧 JPEG（`204` = 还没有帧） |
+| `GET` | `/jobs/{id}/records` | 每帧每个轨迹框（用于播放器叠加） |
+| `GET` | `/jobs/{id}/windows` | 窗口特征 + 分类结果 |
+| `GET` | `/jobs/{id}/logs` | 日志快照（`?since=N` 增量拉取） |
+| `GET` | `/jobs/{id}/video` | 可选导出的标注 mp4 |
+
+实现要点：
+
+* 任务跑在 `spawn_blocking` 线程里，通过 `pipeline::FrameHook` 每帧回调；
+  JPEG 编码按 15 fps 节流，且**只有浏览器连着帧流时才编码**（`FrameBus` 统计订阅者）。
+* 帧订阅者计数必须从 **SSE body 的 stream 内部**增加 —— axum 的 handler 在
+  把 body 交给 hyper 后就被 drop 了，在 handler 里加计数会立刻归零。
+* 日志复用现有 `tracing`：`SseLayer` 把事件转发到 broadcast channel，
+  同时写入每个 job 的日志缓冲区（刷新页面也能看到历史）。
+* 若代理缓冲了 SSE，前端会退化为 REST 轮询任务状态，功能不受影响。
 
 ---
 

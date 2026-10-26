@@ -13,6 +13,7 @@ pub mod pipeline;
 pub mod preprocess;
 pub mod track;
 pub mod video_io;
+pub mod web;
 
 /// Stable re-export surface used by `examples/` (avoids deep paths).
 pub mod debug_api {
