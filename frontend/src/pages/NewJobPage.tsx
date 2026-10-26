@@ -4,6 +4,7 @@ import {
   api,
   type CreateJobRequest,
   type MediaFile,
+  type ModelFile,
   type ServerInfo,
 } from '../api';
 
@@ -21,10 +22,12 @@ export default function NewJobPage() {
   const navigate = useNavigate();
   const [info, setInfo] = useState<ServerInfo | null>(null);
   const [files, setFiles] = useState<MediaFile[]>([]);
+  const [models, setModels] = useState<ModelFile[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [media, setMedia] = useState('');
-  const [detector, setDetector] = useState<'blob' | 'yolo'>('blob');
+  const [detector, setDetector] = useState<'blob' | 'yolo'>('yolo');
+  const [model, setModel] = useState('');
   const [reference, setReference] = useState('');
   const [blobThreshold, setBlobThreshold] = useState(22);
   const [blobMinArea, setBlobMinArea] = useState(0.0015);
@@ -32,7 +35,7 @@ export default function NewJobPage() {
   const [minHits, setMinHits] = useState(5);
   const [maxAge, setMaxAge] = useState(30);
   const [maxFrames, setMaxFrames] = useState('');
-  const [className, setClassName] = useState('mouse');
+  const [className, setClassName] = useState('any');
   const [scoreThr, setScoreThr] = useState(0.2);
   const [window, setWindowS] = useState(0.5);
   const [clf, setClf] = useState('');
@@ -43,14 +46,25 @@ export default function NewJobPage() {
   useEffect(() => {
     (async () => {
       try {
-        const [i, f] = await Promise.all([api.info(), api.listMedia()]);
+        const [i, f, m] = await Promise.all([
+          api.info(),
+          api.listMedia(),
+          api.listModels(),
+        ]);
         setInfo(i);
         setFiles(f);
+        setModels(m);
         setWindowS(i.default_window_s);
         const firstVideo = f.find((x) => VIDEO_EXT.test(x.name));
         if (firstVideo) setMedia(firstVideo.name);
         const emptyRef = f.find((x) => IMAGE_EXT.test(x.name) && /ref|empty/i.test(x.name));
         if (emptyRef) setReference(emptyRef.name);
+        // Prefer the fine-tuned mouse detector over any stock COCO model.
+        const preferred =
+          m.find((x) => x.name === 'mouse.onnx') ??
+          m.find((x) => /mouse|rodent|tst/i.test(x.name)) ??
+          m[0];
+        if (preferred) setModel(preferred.path);
       } catch (e) {
         setLoadError(e instanceof Error ? e.message : String(e));
       }
@@ -79,6 +93,7 @@ export default function NewJobPage() {
       maxFrames: maxFrames ? Number(maxFrames) : undefined,
       className: detector === 'yolo' ? className : undefined,
       scoreThr: detector === 'yolo' ? scoreThr : undefined,
+      model: detector === 'yolo' ? model || undefined : undefined,
       window,
       clf: clf || undefined,
       writeVideo,
@@ -182,8 +197,22 @@ export default function NewJobPage() {
             </>
           ) : (
             <>
+              <label className="field" style={{ minWidth: 220 }}>
+                检测模型
+                <select value={model} onChange={(e) => setModel(e.target.value)}>
+                  {models.length === 0 && (
+                    <option value="">models/ 下没有 .onnx 文件</option>
+                  )}
+                  {models.map((m) => (
+                    <option key={m.path} value={m.path}>
+                      {m.name}
+                      {m.name === 'mouse.onnx' ? '（微调·推荐）' : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <label className="field">
-                类别名
+                类别名（any = 全部）
                 <input value={className} onChange={(e) => setClassName(e.target.value)} />
               </label>
               <label className="field">

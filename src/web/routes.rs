@@ -127,9 +127,52 @@ fn has_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
-// --------------------------------------------------------------------------- //
-// handlers
-// --------------------------------------------------------------------------- //
+/// Directory scanned for ONNX models, relative to the server's working
+/// directory (i.e. the repository root when started with `cargo run`).
+const MODELS_DIR: &str = "models";
+
+/// Model used when the request does not name one. Picked ahead of the stock
+/// `yolo11n.onnx` because COCO has no rodent class at all.
+const DEFAULT_MODEL: &str = "models/mouse.onnx";
+
+/// An `.onnx` file offered to the UI.
+#[derive(Serialize)]
+struct ModelFile {
+    /// Path handed back to `POST /api/jobs` (already relative to the CWD).
+    path: String,
+    name: String,
+    size: u64,
+}
+
+/// `GET /api/models` - list the ONNX files under `models/`.
+///
+/// Only the file list is reported: the model's class names are resolved by the
+/// pipeline itself from the ONNX metadata, so the UI does not need to know
+/// them. `--class-name any` accepts every class regardless.
+async fn list_models() -> Json<Vec<ModelFile>> {
+    let mut out: Vec<ModelFile> = std::fs::read_dir(MODELS_DIR)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.path().is_file()
+                && e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("onnx"))
+        })
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            ModelFile {
+                path: format!("{MODELS_DIR}/{name}"),
+                size: e.metadata().map(|m| m.len()).unwrap_or(0),
+                name,
+            }
+        })
+        .collect();
+    // `mouse.onnx` first, then alphabetical.
+    out.sort_by_key(|m| (m.name != "mouse.onnx", m.name.clone()));
+    Json(out)
+}
 
 async fn info(State(st): State<AppState>) -> Json<ServerInfo> {
     Json(ServerInfo {
@@ -361,23 +404,56 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         .unwrap_or(false)
         .then(|| job_dir.join("annotated.mp4"));
 
+    // Resolve the model path up front: a missing/corrupt model would otherwise
+    // only fail inside the worker thread, long after the job was accepted.
+    let model = req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_MODEL);
+    if detector == DetectorKind::Yolo {
+        // Accept both `mouse.onnx` (bare file name) and `models/mouse.onnx`
+        // (what `/api/models` returns); strip any `models/` prefix first.
+        let bare = model
+            .trim_start_matches("./")
+            .strip_prefix(&format!("{MODELS_DIR}/"))
+            .unwrap_or(model);
+        let exists = safe_join(Path::new(MODELS_DIR), bare).is_some_and(|p| p.is_file());
+        if !exists {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "model not found: {model} (paths are relative to the server's \
+                     working directory `{}`; see GET /api/models)",
+                    std::env::current_dir()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_else(|_| "?".into())
+                ),
+            );
+        }
+    }
+
+    // Empty/"any" means "accept every class"; otherwise use the given name.
+    let class_name = match req.class_name.map(|s| s.trim().to_string()) {
+        Some(c) if !c.is_empty() => c,
+        _ => "any".to_string(),
+    };
+
     let cfg = PipelineConfig {
         input: input.clone(),
         output_video: video_path,
         output_json: None,
         output_csv: None,
         detector,
-        model: req
-            .model
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("models/yolo11n.onnx")),
+        model: PathBuf::from(model),
         max_side: req.max_side.unwrap_or(640).clamp(160, 1920),
         score_thr: req.score_thr.unwrap_or(0.2),
         iou_thr: 0.45,
         blob_threshold: req.blob_threshold.unwrap_or(22),
         blob_min_area: req.blob_min_area.unwrap_or(0.0015),
         reference,
-        class_name: req.class_name.unwrap_or_else(|| "mouse".to_string()),
+        class_name,
         fallback_animal: true,
         detect_every: 1,
         refresh_every: 90,
@@ -744,6 +820,7 @@ fn base64_encode(data: &[u8]) -> String {
 pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
     let api = Router::new()
         .route("/info", get(info))
+        .route("/models", get(list_models))
         .route("/media", get(list_media))
         .route("/media/{name}", get(media_file))
         .route("/jobs", get(list_jobs).post(create_job))

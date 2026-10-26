@@ -17,6 +17,14 @@ export interface MediaFile {
   modified_ms: number;
 }
 
+/** `GET /api/models` - ONNX files the server can load. */
+export interface ModelFile {
+  /** Path to send back as `CreateJobRequest.model`. */
+  path: string;
+  name: string;
+  size: number;
+}
+
 export interface TrackView {
   track_id: number;
   n_windows: number;
@@ -170,6 +178,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   info: () => request<ServerInfo>('/info'),
   listMedia: () => request<MediaFile[]>('/media'),
+  listModels: () => request<ModelFile[]>('/models'),
   mediaUrl: (name: string) => `${BASE}/media/${encodeURIComponent(name)}`,
   listJobs: () => request<JobView[]>('/jobs'),
   getJob: (id: string) => request<JobView>(`/jobs/${id}`),
