@@ -90,6 +90,69 @@ PY
 
 
 # ===========================================================================
+# 步骤 3b：把【所有】图片的标注都画出来，存到 out/roi/
+# ===========================================================================
+# 一张一张看太慢，这里一次性把 dataset/raw/ 里每张图的标注都渲染成 jpg。
+# 文件名和原图一致，方便对照修改。
+# 画三样东西：
+#   红框 = ROI 范围（超出 ROI 的目标不会被标注）
+#   绿框 = 标注框本身
+#   左上角文字 = 文件名 + 本帧框数（框数为 0 的帧要重点看，通常是漏检）
+
+./analytics/.venv/bin/python - <<'PY'
+import cv2, glob, os
+
+os.makedirs("out/roi", exist_ok=True)
+
+# ROI 和步骤 2 的 --roi 保持一致
+x1, y1, x2, y2 = 0.10, 0.10, 0.98, 0.95
+
+images = sorted(glob.glob("dataset/raw/*.jpg")) + sorted(glob.glob("dataset/raw/*.png"))
+empty = 0
+
+for img_path in images:
+    img = cv2.imread(img_path)
+    if img is None:
+        continue
+    h, w = img.shape[:2]
+
+    # 画 ROI
+    cv2.rectangle(img, (int(x1*w), int(y1*h)), (int(x2*w), int(y2*h)), (0, 0, 255), 2)
+
+    # 画标注框
+    n_box = 0
+    lbl = os.path.splitext(img_path)[0] + ".txt"
+    if os.path.exists(lbl):
+        for line in open(lbl):
+            p = line.split()
+            if len(p) != 5:
+                continue
+            _, xc, yc, bw, bh = p
+            xc, yc, bw, bh = float(xc), float(yc), float(bw), float(bh)
+            a = (int((xc - bw/2) * w), int((yc - bh/2) * h))
+            b = (int((xc + bw/2) * w), int((yc + bh/2) * h))
+            cv2.rectangle(img, a, b, (0, 255, 0), 2)
+            n_box += 1
+    if n_box == 0:
+        empty += 1
+
+    # 左上角写文件名和框数（用 "/" 分隔，避免和后缀连在一起看串）
+    tag = f"{os.path.basename(img_path)}  |  boxes = {n_box}"
+    cv2.putText(img, tag, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, tag, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+
+    out_path = os.path.join("out/roi", os.path.basename(img_path))
+    cv2.imwrite(out_path, img)
+
+print(f"共导出 {len(images)} 张到 out/roi/")
+print(f"其中框数为 0 的帧: {empty} 张（这些帧要重点检查是否漏标）")
+PY
+
+ls out/roi | head
+echo "导出图片数: $(ls out/roi | wc -l)"
+
+
+# ===========================================================================
 # 步骤 4：人工修正（本脚本不自动化）
 # ===========================================================================
 # 用任意 YOLO 标注工具打开 dataset/raw/：
