@@ -203,32 +203,102 @@ immobile_prob, label, rii` + 18 个特征。`rii` 是文献里的经典判据
 
 ## 6. 检测模型微调（推荐用于生产）
 
-COCO 模型不认识俯视白鼠。用几百帧自己标注的数据微调即可：
+COCO 模型不认识俯视/悬尾的白鼠（实测最高分是 `cat/bear/bowl`），必须微调。
+**几百帧标注**通常就够（YOLO11n 从预训练权重做单类微调，几十到一两百张也能出效果）。
+
+### 6.1 数据准备（`analytics/make_dataset.py`）
+
+标准 YOLO 格式，一张图一个同名 `.txt`：
+
+```
+<类 ID> <x_center> <y_center> <width> <height>     # 全部归一化到 0..1
+```
+
+四步，每步都可单独跑：
 
 ```bash
-# labels: YOLO 格式 (class cx cy w h, 归一化)，单类 "mouse"
-./analytics/.venv/bin/python analytics/model_tools.py fine-tune \
-  --data dataset/data.yaml --epochs 80 --imgsz 640 --out models/mouse.onnx
+# ① 抽帧：按 1 fps 抽（长视频抽 300 帧约覆盖 5 分钟）
+./analytics/.venv/bin/python analytics/make_dataset.py extract \
+  --video TST.mp4 --out dataset/raw --fps 1 --frames 300 --max-side 960
 
-# 训练→导出到 models/mouse.onnx（含类名 metadata）
+# ② 预标注：用"比全图中位亮度更暗"的连通域自动生成初始框
+#    --channels 是悬尾装置通道数；--roi 限制在装置区域内（重要！）
+./analytics/.venv/bin/python analytics/make_dataset.py autolabel \
+  --raw dataset/raw --channels 6 --roi 0.20,0.12,0.95,0.92
+
+# ③ 人工修正：用 labelImg / Label Studio / CVAT / Roboflow 打开 dataset/raw
+#    （预标注已经很接近，通常每帧只需 1-2 次点击的修正）
+
+# ④ 划分训练/验证集并生成 data.yaml
+./analytics/.venv/bin/python analytics/make_dataset.py split \
+  --raw dataset/raw --out dataset --val-frac 0.2
+
+# ⑤ 校验（缺标签、越界、框太少都会报出来）
+./analytics/.venv/bin/python analytics/make_dataset.py check --dataset dataset
+```
+
+`--roi` 非常关键：不加的话，灯管、线缆、笼具、操作人员的手都会变成"鼠标"。
+`--channels` 直接对应装置通道数（多通道 TST 常见 4/6/12 通道）。
+
+### 6.2 标注要点（比工具更重要）
+
+| 要点 | 说明 |
+|---|---|
+| **类别只有 1 个** | 单类 `mouse`，不要区分身体部位，模型学"整只动物" |
+| **框要贴紧身体** | 含尾巴会让框忽长忽短，干扰追踪；尾巴建议单独决策或忽略 |
+| **姿态要全** | 悬挂、攀爬、蜷缩、剧烈挣扎都要各标一些，否则只认静止姿态 |
+| **跨视频** | 至少 2-3 个不同日期/动物的视频，只用一个视频会过拟合背景 |
+| **按视频划分验证集** | 同一视频的相邻帧几乎相同，随机划分会虚高 mAP；`split` 已按文件划分 |
+| **数量下限** | ≥ 300 框；多通道装置 6 通道 × 50 帧即可 |
+| **难例优先** | 模糊、遮挡、贴壁、与背景同色的帧价值最高 |
+
+### 6.3 训练 + 导出
+
+```bash
+./analytics/.venv/bin/python analytics/model_tools.py fine-tune \
+  --data dataset/data.yaml \
+  --base yolo11n.pt \
+  --epochs 100 --imgsz 640 --batch 16 --device cpu \
+  --out models/mouse.onnx
+
+# 检查导出的类名（Rust 端会从 ONNX metadata 自动读取）
 ./analytics/.venv/bin/python analytics/model_tools.py names models/mouse.onnx
 ```
 
-然后：
+CPU 上 yolo11n + 640px + 100 epoch 约需数小时；有 GPU 时 `--device 0`。
+训练日志里关注 **mAP50**（>0.9 即可用）和 **val 的 P/R**。
+
+### 6.4 用微调后的模型跑 Rust
 
 ```bash
-ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act track \
-  -i trial.mp4 --detector yolo --model models/mouse.onnx --class-name mouse
+ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act analyze \
+  -i TST.mp4 --detector yolo --model models/mouse.onnx --class-name mouse \
+  --windows out/windows.csv -o out/analyzed.mp4
 ```
+
+单类模型也可用 `--class-name any`（全部类别通过），效果相同。
+
+验证检测是否正常（打印某一帧所有候选）：
+
+```bash
+ORT_DYLIB_PATH=models/libonnxruntime.so \
+  cargo run --release --example debug_detect -- TST.mp4 200 0.25 models/mouse.onnx
+```
+
+### 6.5 什么时候不用微调
+
+* **固定机位 + 背景干净 + 动物从不动到动**：`blob` + `--reference` 空场图更快更省事；
+* **多通道悬尾装置**：先试 `blob`，若通道间相互干扰或光照不均再微调；
+* **相机移动 / 光照剧变**：必须用 YOLO（背景法原理失效）。
 
 ---
 
 ## 7. 开发
 
 ```bash
-cargo test                 # 16 个单元测试：匈牙利/卡尔曼/追踪/NMS/blob/中值背景
-cargo run --example debug_detect -- media/x.mp4 40 0.05   # 打印该帧所有候选检测
-cargo run --example debug_blob   -- media/x.mp4 40 22     # 打印 blob 检测结果
+cargo test                 # 24 个单元测试：匈牙利/卡尔曼/追踪/NMS/blob/中值背景/特征/XGBoost
+cargo run --example debug_detect -- media/x.mp4 40 0.05 [model.onnx]  # 打印该帧所有候选检测
+cargo run --example debug_blob   -- media/x.mp4 40 22                 # 打印 blob 检测结果
 ```
 
 调试开关：`RUST_LOG=debug`、`--show-rois`、`--preview-every 25`（终端 ASCII 预览）。

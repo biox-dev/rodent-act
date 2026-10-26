@@ -6,8 +6,10 @@
 #   1. 编译
 #   2. 生成空场参考图  media/empty_ref.png
 #   3. 生成测试视频    media/synthetic_mice.mp4
-#   4. 检测 + 追踪  →  out/tracked.mp4
-#   5. 0.5s 窗口分析 →  out/analyzed.mp4 + out/windows.csv
+#   4. 检测 + 追踪（blob 后端）→  out/tracked.mp4
+#   5. 0.5s 窗口分析（blob 后端）→  out/analyzed.mp4 + out/windows.csv
+#   5b. 检测 + 追踪（YOLO 后端）→  out/yolo_tracked.mp4
+#   6. 截图预览          out/preview.png
 #
 # 运行：  bash test.sh
 
@@ -75,6 +77,64 @@ echo "=== 5. 0.5s 窗口分析 → out/analyzed.mp4 + out/windows.csv ==="
 echo "已生成 out/analyzed.mp4 和 out/windows.csv"
 
 
+# ==================================== 5b. YOLO 后端（ONNX Runtime）==========
+echo ""
+echo "=== 5b. YOLO 后端检测 → out/yolo_tracked.mp4 ==="
+#
+# 说明：这一步验证 *YOLO 推理链路* 能跑通，不代表检测质量可用。
+#   - 需要 models/yolo11n.onnx + ORT 动态库（models/libonnxruntime.so）
+#   - 预置 COCO 模型对合成的深色椭圆会把它们识别成 airplane/cat 之类，
+#     所以这里用 --class-name any 让所有类别通过；
+#   - 换成微调过的模型（analytics/model_tools.py fine-tune）后，
+#     把 --class-name any 改成 --class-name mouse 即可。
+#
+# YOLO 后端不需要 --reference：它是语义检测，不依赖背景差。
+#
+# 若模型或动态库缺失，脚本会打印 SKIP 并继续，不中断后面的步骤。
+#
+# 换成微调过的模型时，改掉下面两行：
+#   YOLO_ONNX=models/mouse.onnx
+#   --class-name mouse
+
+YOLO_ONNX=models/yolo11n.onnx
+
+if [ ! -f "$YOLO_ONNX" ]; then
+  echo "SKIP: 未找到 $YOLO_ONNX，先下载："
+  echo "  curl -sL -o models/yolo11n.onnx \\"
+  echo "    https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx"
+elif [ ! -f models/libonnxruntime.so ]; then
+  echo "SKIP: 未找到 models/libonnxruntime.so（ONNX Runtime 动态库）"
+else
+  echo "使用模型: $YOLO_ONNX"
+
+  # 跑完整 8 秒（200 帧）。CPU 上 YOLO 约 8 fps，这一步需要 ~25 秒。
+  # 想快速看链路是否通，临时改成 --max-frames 60（只处理前 2.4 秒）。
+  ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act track \
+    -i media/synthetic_mice.mp4 \
+    --detector yolo \
+    --model "$YOLO_ONNX" \
+    --class-name any \
+    -o out/yolo_tracked.mp4 \
+    --json out/yolo_tracks.json \
+    --max-side 640 \
+    --min-hits 1 \
+    || echo "YOLO 步骤失败（见上面的错误）"
+
+  echo "已生成 out/yolo_tracked.mp4 / out/yolo_tracks.json"
+fi
+
+
+ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act track \
+    -i TST.mp4 \
+    --detector yolo \
+    --model "$YOLO_ONNX" \
+    --class-name any \
+    -o out/my_yolo_tracked.mp4 \
+    --json out/my_yolo_tracks.json \
+    --max-side 640 \
+    --min-hits 1
+
+
 # ================================================ 6. 截一张图看看 ===========
 echo ""
 echo "=== 6. 从分析视频里截一帧 ==="
@@ -100,6 +160,7 @@ ls -lh out/
 
 echo ""
 echo "=== 下一步可以做的 ==="
-echo "  播放视频:    ffplay out/analyzed.mp4"
+echo "  播放视频:    ffplay out/analyzed.mp4        # blob 后端结果"
+echo "  播放视频:    ffplay out/yolo_tracked.mp4    # YOLO 后端结果"
 echo "  看整张表:    cat out/windows.csv"
 echo "  看某帧截图:  xdg-open out/preview.png"
