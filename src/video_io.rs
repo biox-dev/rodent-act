@@ -181,6 +181,9 @@ pub struct VideoWriter {
     child: Child,
     stdin: Option<ChildStdin>,
     pub path: PathBuf,
+    width: u32,
+    height: u32,
+    frame_bytes: usize,
 }
 
 impl VideoWriter {
@@ -194,28 +197,70 @@ impl VideoWriter {
             .args(["-s", &format!("{width}x{height}")])
             .args(["-r", &format!("{fps}")])
             .args(["-i", "-"])
-            .args(["-an"])
+            // Explicit mapping: the rawvideo demuxer sometimes exposes the
+            // stdin pipe as more than one stream, which would make ffmpeg
+            // write a second moov atom ("Found duplicated MOOV Atom") and a
+            // file no player can decode.
+            .args(["-map", "0:v:0"])
+            .args(["-an", "-sn", "-dn"])
             .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
-            .args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            .args(["-pix_fmt", "yuv420p"])
+            // `+faststart` rewrites the file after encoding; give it room to
+            // and keep the temporary file in the same directory as the target
+            // so the rename stays on one filesystem.
+            .args(["-movflags", "+faststart"])
             .arg(path)
             .stdin(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .context("failed to spawn ffmpeg encoder")?;
+        // Drain stderr on a thread so a chatty encoder can never block on a
+        // full pipe (which would stall our writer and eventually break the
+        // stream with a partial frame).
+        if let Some(err) = child.stderr.take() {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                let mut err = err;
+                let _ = err.read_to_end(&mut buf);
+                let text = String::from_utf8_lossy(&buf);
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    tracing::error!(target: "ffmpeg", "{line}");
+                }
+            });
+        }
         let stdin = child.stdin.take().context("ffmpeg stdin not captured")?;
         Ok(Self {
             child,
             stdin: Some(stdin),
             path: path.to_path_buf(),
+            width,
+            height,
+            frame_bytes: (width as usize) * (height as usize) * 3,
         })
     }
 
     pub fn write_frame(&mut self, rgb: &[u8]) -> Result<()> {
-        self.stdin
+        if rgb.len() != self.frame_bytes {
+            bail!(
+                "frame size mismatch: got {} bytes, encoder expects {} ({}x{} rgb24)",
+                rgb.len(),
+                self.frame_bytes,
+                self.width,
+                self.height
+            );
+        }
+        let stdin = self
+            .stdin
             .as_mut()
-            .context("ffmpeg stdin already closed")?
-            .write_all(rgb)
-            .context("writing frame to ffmpeg")
+            .context("ffmpeg stdin already closed")?;
+        match stdin.write_all(rgb) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                bail!("ffmpeg encoder closed its input early (encode failed); see ffmpeg log above")
+            }
+            Err(e) => Err(e).context("writing frame to ffmpeg"),
+        }
     }
 
     /// Flush and finalize the file. Must be called for a valid output.
@@ -234,8 +279,22 @@ impl VideoWriter {
 
 impl Drop for VideoWriter {
     fn drop(&mut self) {
-        // If finish() was not called, still try not to leave a zombie.
-        let _ = self.child.try_wait();
+        // If finish() was not called the encoder never wrote a valid trailer,
+        // so the file on disk is undecodable. Kill the encoder and remove the
+        // half-written output instead of leaving a corrupt MP4 behind.
+        if self.stdin.take().is_some() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if self.path.exists() {
+                let _ = std::fs::remove_file(&self.path);
+                tracing::warn!(
+                    path = %self.path.display(),
+                    "removed incomplete video (pipeline stopped before finishing)"
+                );
+            }
+        } else {
+            let _ = self.child.try_wait();
+        }
     }
 }
 

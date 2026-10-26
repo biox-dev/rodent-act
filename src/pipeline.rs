@@ -274,7 +274,21 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
         let moving = motion.update(&frame.data);
         let force_refresh = frame_count % cfg.refresh_every.max(1) == 0;
         let periodic = frame_count % cfg.detect_every.max(1) == 0;
-        let should_detect = (moving && periodic) || force_refresh;
+        // NOTE: gating on `moving` is a *performance* optimisation for busy
+        // scenes, but it is wrong for tail-suspension: the animal is still for
+        // most of the trial, and "still" is exactly what we must measure. A
+        // motion gate would then skip almost every frame and the tracker would
+        // only see a handful of detections, producing short, fragmented tracks.
+        //
+        // So: always run the detector when the motion gate is disabled
+        // (`detect_every = 1`), and only use the gate when the caller
+        // explicitly asked for subsampling.
+        let gated = cfg.detect_every > 1;
+        let should_detect = if gated {
+            (moving && periodic) || force_refresh
+        } else {
+            true
+        };
 
         // --- 2. ROI proposal + detection -----------------------------------
         let rois: Vec<Bbox> = if moving {
