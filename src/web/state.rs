@@ -16,7 +16,7 @@ use image::codecs::jpeg::JpegEncoder;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
-use crate::pipeline::{self, AnalyzeReport, PipelineConfig, RunInfo};
+use crate::pipeline::{self, AnalyzeReport, PipelineConfig, RunInfo, ScoredWindow};
 use crate::web::telemetry::LogRecord;
 
 /// Annotated frame handed to the UI.
@@ -199,6 +199,9 @@ pub struct Job {
     /// Tracking records, available as soon as the tracking pass finishes.
     pub run: RwLock<Option<Arc<RunInfo>>>,
     pub report: RwLock<Option<Arc<AnalyzeReport>>>,
+    /// Windows scored so far, growing while the job runs (live curve/table).
+    pub windows: RwLock<Vec<ScoredWindow>>,
+    pub feature_names: RwLock<Vec<String>>,
     pub video: RwLock<Option<PathBuf>>,
     pub frames: Arc<FrameBus>,
     pub logs: Arc<RwLock<Vec<LogRecord>>>,
@@ -263,6 +266,72 @@ pub struct TrackView {
     pub immobile_fraction: f32,
 }
 
+impl SummaryView {
+    fn from_report(run: &RunInfo, report: &AnalyzeReport) -> Self {
+        let mut s = Self::from_windows(run, &report.windows);
+        s.n_tracks = report.n_tracks;
+        s.mean_immobile_prob = report.mean_immobile_prob;
+        s.per_track = report
+            .per_track_immobile_fraction
+            .iter()
+            .map(|(id, frac)| TrackView {
+                track_id: *id,
+                n_windows: report.windows.iter().filter(|w| w.track_id == *id).count(),
+                immobile_fraction: *frac,
+            })
+            .collect();
+        s
+    }
+
+    /// Stats from the windows scored so far (live view).
+    fn from_windows(run: &RunInfo, windows: &[ScoredWindow]) -> Self {
+        use crate::classify::ActClass;
+        let n_windows = windows.len();
+        let mut by_track: std::collections::BTreeMap<usize, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for w in windows {
+            let e = by_track.entry(w.track_id).or_insert((0, 0));
+            e.1 += 1;
+            if w.label == ActClass::Immobile {
+                e.0 += 1;
+            }
+        }
+        Self {
+            width: run.width,
+            height: run.height,
+            fps: run.fps,
+            frames: run.frames,
+            duration_s: run.duration_s,
+            n_tracks: by_track.len(),
+            n_windows,
+            immobile_windows: windows.iter().filter(|w| w.label == ActClass::Immobile).count(),
+            mobile_windows: windows.iter().filter(|w| w.label == ActClass::Mobile).count(),
+            mean_immobile_prob: if n_windows == 0 {
+                0.0
+            } else {
+                windows.iter().map(|w| w.immobile_prob).sum::<f32>() / n_windows as f32
+            },
+            mean_rii: if n_windows == 0 {
+                0.0
+            } else {
+                windows.iter().map(|w| w.rii).sum::<f32>() / n_windows as f32
+            },
+            per_track: by_track
+                .into_iter()
+                .map(|(id, (imm, total))| TrackView {
+                    track_id: id,
+                    n_windows: total,
+                    immobile_fraction: if total > 0 {
+                        imm as f32 / total as f32
+                    } else {
+                        0.0
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
 impl Job {
     pub fn view(&self) -> JobView {
         let frames_done = *self.frames_done.read().unwrap_or_else(|e| e.into_inner());
@@ -273,41 +342,15 @@ impl Job {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let run = self.run.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let live_windows = self.windows.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // Live stats: the summary is derived from whatever has been scored so
+        // far, so the header tiles update while the job is still running and
+        // are identical to the final report once `report` is set.
         let summary = match (run, report) {
-            (Some(run), Some(report)) => Some(SummaryView {
-                width: run.width,
-                height: run.height,
-                fps: run.fps,
-                frames: run.frames,
-                duration_s: run.duration_s,
-                n_tracks: report.n_tracks,
-                n_windows: report.windows.len(),
-                immobile_windows: report
-                    .windows
-                    .iter()
-                    .filter(|w| w.label == crate::classify::ActClass::Immobile)
-                    .count(),
-                mobile_windows: report
-                    .windows
-                    .iter()
-                    .filter(|w| w.label == crate::classify::ActClass::Mobile)
-                    .count(),
-                mean_immobile_prob: report.mean_immobile_prob,
-                mean_rii: if report.windows.is_empty() {
-                    0.0
-                } else {
-                    report.windows.iter().map(|w| w.rii).sum::<f32>() / report.windows.len() as f32
-                },
-                per_track: report
-                    .per_track_immobile_fraction
-                    .iter()
-                    .map(|(id, frac)| TrackView {
-                        track_id: *id,
-                        n_windows: report.windows.iter().filter(|w| w.track_id == *id).count(),
-                        immobile_fraction: *frac,
-                    })
-                    .collect(),
-            }),
+            (Some(run), Some(report)) => Some(SummaryView::from_report(&run, &report)),
+            (Some(run), None) if !live_windows.is_empty() => {
+                Some(SummaryView::from_windows(&run, &live_windows))
+            }
             _ => None,
         };
         let progress = if total == 0 {
@@ -398,6 +441,62 @@ pub struct CompletedRun {
     pub video: Option<PathBuf>,
 }
 
+/// Append-only `windows.csv` writer used by the live job.
+///
+/// The header is written once at job start, then one line per scored window as
+/// soon as the window completes - so `out/web/<job>/windows.csv` is readable
+/// (and tail-able) during the run, not just at the end.
+struct LiveCsv {
+    path: PathBuf,
+    file: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl LiveCsv {
+    fn create(path: &Path) -> Result<Self> {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).ok();
+        }
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        {
+            use std::io::Write as _;
+            write!(f, "track_id,start_frame,end_frame,start_t,end_t,immobile_prob,label,rii")?;
+            for n in crate::features::FEATURE_NAMES {
+                write!(f, ",{n}")?;
+            }
+            writeln!(f)?;
+            f.flush()?;
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(f),
+        })
+    }
+
+    fn append(&mut self, windows: &[ScoredWindow]) {
+        let Some(f) = self.file.as_mut() else {
+            return;
+        };
+        if pipeline::write_window_rows(f, windows).is_err() {
+            return;
+        }
+        // Flush per batch (not per row): the UI polls the file rarely, and a
+        // flush per window would be measurable at 0.5 s windows.
+        let _ = std::io::Write::flush(f);
+    }
+
+    fn finish(&mut self) {
+        if let Some(mut f) = self.file.take() {
+            let _ = std::io::Write::flush(&mut f);
+        }
+    }
+
+    /// Replace the file with the authoritative batch report.
+    fn rewrite(&mut self, report: &AnalyzeReport) -> Result<()> {
+        self.finish();
+        pipeline::write_window_csv(&self.path, &report.feature_names, &report.windows)
+    }
+}
+
 /// Blocking worker: runs the pipeline and scoring for one job.
 ///
 /// Called from `tokio::task::spawn_blocking`; every channel send is
@@ -413,11 +512,21 @@ pub fn execute(
     let frames = job.frames.clone();
     let cancel = job.cancel_flag();
     let progress_job = job.clone();
+    // Windows scored *during* tracking are appended here, so the UI can show
+    // the curve/table live instead of waiting for the whole video.
+    let csv_sink = LiveCsv::create(&csv_path)?;
+    if let Ok(mut g) = job.feature_names.write() {
+        *g = crate::features::FEATURE_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    }
 
     struct WebHook {
         frames: Arc<FrameBus>,
         job: Arc<Job>,
         cancel: Arc<AtomicBool>,
+        csv: std::sync::Mutex<LiveCsv>,
     }
 
     impl pipeline::FrameHook for WebHook {
@@ -442,6 +551,17 @@ pub fn execute(
             }
         }
 
+        fn on_windows(&mut self, windows: &[ScoredWindow]) {
+            if !windows.is_empty()
+                && let Ok(mut csv) = self.csv.lock()
+            {
+                csv.append(windows);
+            }
+            if let Ok(mut g) = self.job.windows.write() {
+                g.extend_from_slice(windows);
+            }
+        }
+
         fn cancelled(&self) -> bool {
             self.cancel.load(Ordering::Relaxed)
         }
@@ -451,9 +571,12 @@ pub fn execute(
         frames: frames.clone(),
         job: progress_job,
         cancel,
+        csv: std::sync::Mutex::new(csv_sink),
     };
 
-    let run = pipeline::run_with_hook(&cfg, Some(&mut hook)).context("tracking pipeline")?;
+    let mut run_cfg = cfg.clone();
+    run_cfg.live_scoring = Some(analyze_cfg.clone());
+    let run = pipeline::run_with_hook(&run_cfg, Some(&mut hook)).context("tracking pipeline")?;
     if job.cancel.load(Ordering::Relaxed) {
         job.set_status(JobStatus::Cancelled);
         let _ = job.finished.send(true);
@@ -462,8 +585,24 @@ pub fn execute(
     }
 
     job.set_status(JobStatus::Running);
+    // `run` breaks out of the loop on `max_frames`, so the live windows are
+    // already complete: recomputing would only duplicate work. The batch
+    // report is still built from the same records to keep one code path for
+    // the summary (means, per-track fractions).
     let report = pipeline::score_tracks(&run, &analyze_cfg).context("window scoring")?;
-    pipeline::write_window_csv(&csv_path, &report.feature_names, &report.windows).ok();
+    if let Ok(mut g) = job.windows.write()
+        && (g.len() != report.windows.len()
+            || g.iter()
+                .zip(&report.windows)
+                .any(|(a, b)| a.start_frame != b.start_frame || a.track_id != b.track_id))
+    {
+        // Defensive: fall back to the authoritative batch result.
+        *g = report.windows.clone();
+        if let Ok(mut csv) = hook.csv.lock() {
+            csv.rewrite(&report)?;
+        }
+    }
+    hook.csv.lock().map(|mut c| c.finish()).ok();
 
     let video = cfg
         .output_video

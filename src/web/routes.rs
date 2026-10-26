@@ -468,6 +468,7 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         threads: 2,
         max_frames: req.max_frames.filter(|n| *n > 0),
         preview_every: None,
+        live_scoring: None,
     };
     let analyze_cfg = AnalyzeConfig {
         classifier: req.clf.filter(|s| !s.is_empty()).map(PathBuf::from),
@@ -488,6 +489,13 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         total_frames: std::sync::RwLock::new(0),
         run: std::sync::RwLock::new(None),
         report: std::sync::RwLock::new(None),
+        windows: std::sync::RwLock::new(Vec::new()),
+        feature_names: std::sync::RwLock::new(
+            crate::features::FEATURE_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
         video: std::sync::RwLock::new(None),
         frames: Arc::new(state::FrameBus::new(15.0, 72)),
         logs: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -579,22 +587,114 @@ async fn job_records(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -
     .into_response()
 }
 
-async fn job_windows(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+/// Scored windows. Available *while the job runs*: `complete` is false until
+/// the final report exists, and `progress` tells the UI how much of the video
+/// has been scored so the curve can be drawn live.
+async fn job_windows(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     let Some(job) = st.jobs.get(&id) else {
         return api_error(StatusCode::NOT_FOUND, "unknown job");
     };
     let report = job.report.read().ok().and_then(|g| g.clone());
-    match report {
-        Some(report) => Json(serde_json::json!({
-            "feature_names": report.feature_names,
-            "mean_immobile_prob": report.mean_immobile_prob,
-            "per_track_immobile_fraction": report.per_track_immobile_fraction,
-            "windows": report.windows,
-        }))
-        .into_response(),
-        None => api_error(StatusCode::CONFLICT, "job still running"),
-    }
+    let windows = job
+        .windows
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let names = job
+        .feature_names
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let done = *job.frames_done.read().unwrap_or_else(|e| e.into_inner());
+    let total = *job.total_frames.read().unwrap_or_else(|e| e.into_inner());
+    let status = job.status();
+    // An idle job with no window yet is "not started" rather than "running";
+    // the UI uses this to keep polling instead of showing an empty chart.
+    let complete = report.is_some() || status.is_terminal();
+    Json(serde_json::json!({
+        "feature_names": names,
+        "mean_immobile_prob": report.as_ref().map(|r| r.mean_immobile_prob),
+        "per_track_immobile_fraction": report.as_ref().map(|r| &r.per_track_immobile_fraction),
+        "windows": windows,
+        "complete": complete,
+        "status": status,
+        "progress": if total > 0 { (done as f64 / total as f64).clamp(0.0, 1.0) } else { 0.0 },
+        "frames_done": done,
+        "total_frames": total,
+    }))
+    .into_response()
 }
+
+/// Live window updates. Each `windows` event carries the windows scored since
+/// the previous event, so the client appends instead of re-downloading.
+async fn job_window_events(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    let mut finished_rx = job.finished.subscribe();
+    let job_poll = job.clone();
+
+    let stream = async_stream::stream! {
+        let mut sent = 0usize;
+        let mut ticker = tokio::time::interval(Duration::from_millis(700));
+        loop {
+            tokio::select! {
+                biased;
+                changed = finished_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    // Flush whatever is left before closing the stream.
+                    let pending: Vec<_> = job_poll
+                        .windows
+                        .read()
+                        .map(|g| g.get(sent..).map(|s| s.to_vec()).unwrap_or_default())
+                        .unwrap_or_default();
+                    if !pending.is_empty() {
+                        yield Ok::<Event, Infallible>(window_event(&pending, job_poll.status().is_terminal()));
+                    }
+                    yield Ok(Event::default().event("done").data("{}"));
+                    return;
+                }
+                _ = ticker.tick() => {
+                    let pending: Vec<_> = job_poll
+                        .windows
+                        .read()
+                        .map(|g| g.get(sent..).map(|s| s.to_vec()).unwrap_or_default())
+                        .unwrap_or_default();
+                    if !pending.is_empty() {
+                        sent += pending.len();
+                        yield Ok(window_event(&pending, job_poll.status().is_terminal()));
+                    } else if job_poll.status().is_terminal() {
+                        yield Ok(Event::default().event("done").data("{}"));
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+fn window_event(windows: &[crate::pipeline::ScoredWindow], complete: bool) -> Event {
+    let data = serde_json::json!({
+        "complete": complete,
+        "windows": windows,
+    });
+    Event::default()
+        .event("windows")
+        .data(serde_json::to_string(&data).unwrap_or_else(|_| "{}".into()))
+}
+
 
 async fn job_logs(
     State(st): State<AppState>,
@@ -831,6 +931,7 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
         .route("/jobs/{id}/frames", get(frame_stream))
         .route("/jobs/{id}/records", get(job_records))
         .route("/jobs/{id}/windows", get(job_windows))
+        .route("/jobs/{id}/window-events", get(job_window_events))
         .route("/jobs/{id}/logs", get(job_logs))
         .route("/jobs/{id}/video", get(job_video))
         .with_state(state);

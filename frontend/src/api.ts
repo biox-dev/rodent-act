@@ -108,9 +108,17 @@ export interface ScoredWindow {
 
 export interface WindowsResponse {
   feature_names: string[];
-  mean_immobile_prob: number;
-  per_track_immobile_fraction: [number, number][];
+  /** `null` while the job is still running (live windows have no report yet). */
+  mean_immobile_prob: number | null;
+  /** `null` while the job is still running. */
+  per_track_immobile_fraction: [number, number][] | null;
   windows: ScoredWindow[];
+  /** False until the final report exists (or the job reached a terminal state). */
+  complete: boolean;
+  status: JobStatus;
+  progress: number;
+  frames_done: number;
+  total_frames: number;
 }
 
 export interface LogRecord {
@@ -189,6 +197,7 @@ export const api = {
   windows: (id: string) => request<WindowsResponse>(`/jobs/${id}/windows`),
   logs: (id: string, since = 0) => request<LogsResponse>(`/jobs/${id}/logs?since=${since}`),
   eventsUrl: (id: string) => `${BASE}/jobs/${id}/events`,
+  windowEventsUrl: (id: string) => `${BASE}/jobs/${id}/window-events`,
   framesUrl: (id: string) => `${BASE}/jobs/${id}/frames`,
   frameUrl: (id: string) => `${BASE}/jobs/${id}/frame`,
   videoUrl: (id: string) => `${BASE}/jobs/${id}/video`,

@@ -10,13 +10,26 @@ interface Props {
   mode: 'prob' | 'speed';
   /** Feature index for `speed` mode (e.g. speed_mean). */
   featureIndex?: number;
+  /**
+   * Total video duration. While scoring is still running the data only
+   * covers part of the video; anchoring the axis to the full duration keeps
+   * the curve growing left-to-right instead of rescaling on every frame.
+   */
+  duration?: number;
 }
 
 /**
  * Dependency-free SVG line chart: immobility probability (or a raw feature)
  * per window, one polyline per track.
  */
-export default function SeriesChart({ windows, current, height = 180, mode, featureIndex = 0 }: Props) {
+export default function SeriesChart({
+  windows,
+  current,
+  height = 180,
+  mode,
+  featureIndex = 0,
+  duration,
+}: Props) {
   const series = useMemo(() => {
     const byTrack = new Map<number, { t: number; v: number }[]>();
     for (const w of windows) {
@@ -42,8 +55,8 @@ export default function SeriesChart({ windows, current, height = 180, mode, feat
         mv = Math.max(mv, p.v);
       }
     }
-    return { maxT: mt, maxV: mv * 1.05 };
-  }, [series, mode]);
+    return { maxT: Math.max(mt, duration ?? 0), maxV: mv * 1.05 };
+  }, [series, mode, duration]);
 
   if (series.length === 0) return <div className="empty">暂无数据</div>;
 

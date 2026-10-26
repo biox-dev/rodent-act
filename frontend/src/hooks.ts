@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type DetectionRecord, type JobView, type LogRecord } from './api';
+import { api, type DetectionRecord, type JobView, type LogRecord, type ScoredWindow } from './api';
 
 export interface ProgressState {
   running: boolean;
@@ -170,10 +170,105 @@ export function useFrameStream(jobId: string | undefined, enabled: boolean): Fra
   return frame;
 }
 
-/** Load tracking records + scored windows once a job is done. */
+export interface LiveWindows {
+  featureNames: string[];
+  windows: ScoredWindow[];
+  /** True once the final report exists. */
+  complete: boolean;
+}
+
+/**
+ * Scored windows, live.
+ *
+ * Windows are scored while the video is still being tracked, so we fetch the
+ * snapshot with `/api/jobs/{id}/windows` and then append the deltas pushed by
+ * `/api/jobs/{id}/window-events` (SSE). A short REST poll covers proxies that
+ * buffer streams, and it is the only mechanism needed once the job is done.
+ */
+export function useLiveWindows(jobId: string | undefined, active: boolean) {
+  const [state, setState] = useState<LiveWindows>({
+    featureNames: [],
+    windows: [],
+    complete: false,
+  });
+
+  // Keep a set of scored window keys so re-connects / polls never duplicate.
+  const seen = useRef<Set<string>>(new Set());
+  const key = (w: ScoredWindow) => `${w.track_id}:${w.start_frame}`;
+
+  const merge = useCallback((incoming: ScoredWindow[]) => {
+    if (incoming.length === 0) return;
+    setState((prev) => {
+      const next = prev.windows.slice();
+      let added = false;
+      for (const w of incoming) {
+        const k = key(w);
+        if (seen.current.has(k)) continue;
+        seen.current.add(k);
+        next.push(w);
+        added = true;
+      }
+      return added ? { ...prev, windows: next } : prev;
+    });
+  }, []);
+
+  const load = useCallback(async () => {
+    if (!jobId) return;
+    try {
+      const res = await api.windows(jobId);
+      setState((prev) => ({
+        featureNames: res.feature_names.length ? res.feature_names : prev.featureNames,
+        windows: res.windows,
+        complete: res.complete,
+      }));
+      seen.current = new Set(res.windows.map(key));
+    } catch {
+      /* job just created; retry on the next tick */
+    }
+  }, [jobId]);
+
+  useEffect(() => {
+    if (!jobId) return;
+    seen.current = new Set();
+    setState({ featureNames: [], windows: [], complete: false });
+    void load();
+
+    const es = new EventSource(api.windowEventsUrl(jobId));
+    es.addEventListener('windows', (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as {
+        complete: boolean;
+        windows: ScoredWindow[];
+      };
+      merge(data.windows);
+      if (data.complete) setState((p) => ({ ...p, complete: true }));
+    });
+    es.addEventListener('done', () => {
+      es.close();
+      setState((p) => ({ ...p, complete: true }));
+      void load();
+    });
+    es.onerror = () => {
+      /* EventSource reconnects by itself */
+    };
+
+    // Safety net: also sync the snapshot while running, so a buffering proxy
+    // still shows the growing table (just at poll latency).
+    const timer = active
+      ? window.setInterval(() => void load(), 2000)
+      : undefined;
+
+    return () => {
+      es.close();
+      if (timer) window.clearInterval(timer);
+    };
+  }, [jobId, active, load, merge]);
+
+  return state;
+}
+
+/** Load tracking records (per-frame boxes) once the tracking pass is done. */
 export function useAnalysis(jobId: string | undefined, ready: boolean) {
   const [records, setRecords] = useState<Awaited<ReturnType<typeof api.records>> | null>(null);
-  const [windows, setWindows] = useState<Awaited<ReturnType<typeof api.windows>> | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -181,10 +276,9 @@ export function useAnalysis(jobId: string | undefined, ready: boolean) {
     let cancelled = false;
     (async () => {
       try {
-        const [r, w] = await Promise.all([api.records(jobId), api.windows(jobId)]);
+        const r = await api.records(jobId);
         if (!cancelled) {
           setRecords(r);
-          setWindows(w);
           setError(null);
         }
       } catch (e) {
@@ -212,5 +306,5 @@ export function useAnalysis(jobId: string | undefined, ready: boolean) {
     return map;
   }, [records]);
 
-  return { records, windows, byFrame, error };
+  return { records, byFrame, error };
 }

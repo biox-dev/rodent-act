@@ -62,6 +62,10 @@ pub struct PipelineConfig {
     pub threads: usize,
     pub max_frames: Option<usize>,
     pub preview_every: Option<usize>,
+    /// Score 0.5 s windows *while* tracking and hand them to the hook, so the
+    /// web UI can draw the curve live. `None` (CLI) leaves scoring to the
+    /// caller after the run.
+    pub live_scoring: Option<AnalyzeConfig>,
 }
 
 impl Default for PipelineConfig {
@@ -90,6 +94,7 @@ impl Default for PipelineConfig {
             threads: 2,
             max_frames: None,
             preview_every: None,
+            live_scoring: None,
         }
     }
 }
@@ -162,6 +167,10 @@ pub struct FrameView<'a> {
 /// to a channel or a worker rather than blocking here.
 pub trait FrameHook: Send {
     fn on_frame(&mut self, frame: &FrameView<'_>);
+
+    /// Called when one or more windows finished scoring during the same frame
+    /// (only when [`PipelineConfig::live_scoring`] is set).
+    fn on_windows(&mut self, _windows: &[ScoredWindow]) {}
 
     /// Return `true` to stop the pipeline after the current frame
     /// (used by the web UI's cancel button). Defaults to never stopping.
@@ -308,6 +317,15 @@ pub fn run_with_hook(
 
     // Keep only tracks of the requested class in the output.
     let mut first_refresh_done = false;
+    // Live window scoring for observers (web UI): fills the trailing records
+    // of `all_records` that this frame produced, so the incremental result
+    // matches the batch report exactly.
+    let mut live = match (cfg.live_scoring.as_ref(), hook.as_ref()) {
+        (Some(analyze_cfg), Some(_)) => {
+            Some(LiveScorer::new(analyze_cfg, w, h, fps)?)
+        }
+        _ => None,
+    };
 
     while let Some(mut frame) = reader.next_frame()? {
         if let Some(max) = cfg.max_frames
@@ -431,6 +449,28 @@ pub fn run_with_hook(
             wtr.write_frame(&frame.data)?;
         }
 
+        // --- 4a. live window scoring (web UI) -------------------------------
+        // Runs before the hook callback so the freshly appended records are
+        // exactly the ones `LiveScorer` consumes.
+        if let (Some(scorer), Some(obs)) = (live.as_mut(), hook.as_mut()) {
+            let tracks: Vec<_> = tracker
+                .tracks
+                .iter()
+                .filter(|t| t.is_confirmed() && keep(t.class_id))
+                .cloned()
+                .collect();
+            let mut energy: HashMap<usize, f32> = HashMap::new();
+            if let Some(bd) = blob.as_ref() {
+                for t in &tracks {
+                    energy.insert(t.id, mask_ratio_in(bd, &t.bbox(), w, h));
+                }
+            }
+            let fresh = scorer.push(frame.index, &tracks, &energy);
+            if !fresh.is_empty() {
+                obs.on_windows(&fresh);
+            }
+        }
+
         // --- 4b. stream the annotated frame to observers (web UI) -----------
         if let Some(obs) = hook.as_mut() {
             obs.on_frame(&FrameView {
@@ -483,6 +523,14 @@ pub fn run_with_hook(
     }
 
     pb.finish_with_message("done");
+
+    // Score the trailing windows that only became complete at the end.
+    if let (Some(mut scorer), Some(obs)) = (live.take(), hook.as_mut()) {
+        let tail = scorer.flush();
+        if !tail.is_empty() {
+            obs.on_windows(&tail);
+        }
+    }
 
     if let Some(wtr) = writer {
         let path = wtr.path.clone();
@@ -661,7 +709,7 @@ impl Default for AnalyzeConfig {
 }
 
 /// One scored window.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredWindow {
     pub track_id: usize,
     pub start_frame: usize,
@@ -808,6 +856,201 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
     })
 }
 
+/// Incremental version of [`score_tracks`] for the live web view.
+///
+/// Windows are emitted while the video is still being tracked, so the UI can
+/// show the immobility curve and the window table as they grow. The final
+/// report produced by [`score_tracks`] is identical to the concatenation of
+/// everything emitted here (same window grid, same reference size, same
+/// features), so the end state of the live view matches the persisted CSV.
+pub struct LiveScorer {
+    clf: Box<dyn crate::classify::Classifier>,
+    fps: f64,
+    /// Window length / stride in frames.
+    n: usize,
+    stride: usize,
+    frame_diag: f32,
+    /// Per-frame boxes of every track seen so far.
+    tracks: HashMap<usize, Vec<(usize, Bbox, f32)>>,
+    /// Next window index to emit, per track.
+    next: HashMap<usize, usize>,
+    /// Once a track ends its reference size is frozen, so windows already
+    /// emitted keep a consistent normalisation.
+    frozen: std::collections::HashSet<usize>,
+}
+
+impl LiveScorer {
+    pub fn new(cfg: &AnalyzeConfig, frame_w: u32, frame_h: u32, fps: f64) -> Result<Self> {
+        let clf = crate::classify::load_or_baseline(cfg.classifier.as_deref())?;
+        let n = ((cfg.window_s * fps).round() as usize).max(2);
+        let stride = ((cfg.stride_s * fps).round() as usize).max(1);
+        Ok(Self {
+            clf,
+            fps,
+            n,
+            stride,
+            frame_diag: ((frame_w * frame_w + frame_h * frame_h) as f32).sqrt(),
+            tracks: HashMap::new(),
+            next: HashMap::new(),
+            frozen: std::collections::HashSet::new(),
+        })
+    }
+
+    /// Append one frame of tracking output and return every window that just
+    /// became complete.
+    ///
+    /// `energy` maps track id -> mean blob foreground ratio of this frame
+    /// (empty for the YOLO backend, whose records carry 0.0 like `run`).
+    pub fn push(
+        &mut self,
+        frame: usize,
+        tracks: &[crate::track::Track],
+        energy: &HashMap<usize, f32>,
+    ) -> Vec<ScoredWindow> {
+        for t in tracks {
+            self.tracks.entry(t.id).or_default().push((
+                frame,
+                t.bbox(),
+                energy.get(&t.id).copied().unwrap_or(0.0),
+            ));
+        }
+        let mut out = Vec::new();
+        for t in tracks {
+            let Some(recs) = self.tracks.get(&t.id) else {
+                continue;
+            };
+            let mut i = *self.next.get(&t.id).unwrap_or(&0);
+            while i + self.n <= recs.len() {
+                if let Some(w) = self.score_window(t.id, &recs[i..i + self.n]) {
+                    out.push(w);
+                }
+                i += self.stride;
+            }
+            self.next.insert(t.id, i);
+        }
+        out
+    }
+
+    /// Score whatever tail is still pending (call once tracking finished).
+    ///
+    /// Window `i` is scored when the history covers `i + stride` frames, so
+    /// the frames the tracker's ring buffer may drop are never needed.
+    pub fn flush(&mut self) -> Vec<ScoredWindow> {
+        let ids: Vec<usize> = self.tracks.keys().copied().collect();
+        let mut out = Vec::new();
+        for tid in ids {
+            self.frozen.insert(tid);
+            let Some(recs) = self.tracks.get(&tid) else {
+                continue;
+            };
+            let len = recs.len();
+            let start = *self.next.get(&tid).unwrap_or(&0);
+            let mut i = start;
+            while i < len {
+                let end = (i + self.n).min(len);
+                if end.saturating_sub(i) >= 2
+                    && let Some(w) = self.score_window(tid, &recs[i..end])
+                {
+                    out.push(w);
+                }
+                i += self.stride;
+            }
+        }
+        out
+    }
+
+    fn score_window(&self, tid: usize, slice: &[(usize, Bbox, f32)]) -> Option<ScoredWindow> {
+        if slice.len() < 2 {
+            return None;
+        }
+        let ref_size = if self.frozen.contains(&tid) {
+            median_diag(slice)
+        } else {
+            self.tracks
+                .get(&tid)
+                .map(|r| median_diag(r))
+                .unwrap_or(1.0)
+        };
+        let samples: Vec<(f64, Bbox)> = slice
+            .iter()
+            .map(|(f, b, _)| (*f as f64 / self.fps, *b))
+            .collect();
+        let mut w = crate::features::compute_window(
+            tid,
+            slice[0].0,
+            slice[slice.len() - 1].0,
+            &samples,
+            ref_size,
+            self.fps,
+        );
+        let energy: f32 = slice.iter().map(|(_, _, e)| *e).sum::<f32>() / slice.len() as f32;
+        if let Some(idx) = w.names.iter().position(|s| s == "motion_energy") {
+            w.values[idx] = energy;
+        }
+        if let Some(idx) = w.names.iter().position(|s| s == "size_norm") {
+            w.values[idx] = (ref_size / self.frame_diag).clamp(0.0, 1.0);
+        }
+        let pred = self.clf.predict(&w.values).ok()?;
+        let rii = crate::features::rii_score(&samples, crate::features::RII_PIXEL_THRESHOLD);
+        Some(ScoredWindow {
+            track_id: tid,
+            start_frame: w.start_frame,
+            end_frame: w.end_frame,
+            start_t: w.start_t,
+            end_t: w.end_t,
+            immobile_prob: pred.immobile_prob,
+            label: pred.label,
+            rii,
+            values: w.values,
+        })
+    }
+}
+
+/// Median body diagonal over a track's boxes (same rule as `score_tracks`).
+fn median_diag(recs: &[(usize, Bbox, f32)]) -> f32 {
+    if recs.is_empty() {
+        return 1.0;
+    }
+    let mut diags: Vec<f32> = recs
+        .iter()
+        .map(|(_, b, _)| {
+            let (w, h) = b.wh();
+            (w * w + h * h).sqrt()
+        })
+        .collect();
+    diags.sort_by(|a, b| a.total_cmp(b));
+    diags[diags.len() / 2].max(1.0)
+}
+
+/// Write scored windows as CSV rows (no header) into `w`.
+///
+/// Shared by the batch [`write_window_csv`] and the web server's live writer,
+/// so both emit byte-identical rows.
+pub fn write_window_rows<W: std::io::Write>(w: &mut W, windows: &[ScoredWindow]) -> Result<()> {
+    for win in windows {
+        write!(
+            w,
+            "{},{},{},{:.3},{:.3},{:.4},{},{:.3}",
+            win.track_id,
+            win.start_frame,
+            win.end_frame,
+            win.start_t,
+            win.end_t,
+            win.immobile_prob,
+            match win.label {
+                crate::classify::ActClass::Immobile => "immobile",
+                crate::classify::ActClass::Mobile => "mobile",
+            },
+            win.rii
+        )?;
+        for v in &win.values {
+            write!(w, ",{v:.5}")?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
 /// Write a scored report as CSV (one row per window).
 pub fn write_window_csv(path: &Path, names: &[String], windows: &[ScoredWindow]) -> Result<()> {
     use std::io::Write as _;
@@ -823,27 +1066,7 @@ pub fn write_window_csv(path: &Path, names: &[String], windows: &[ScoredWindow])
         write!(f, ",{n}")?;
     }
     writeln!(f)?;
-    for w in windows {
-        write!(
-            f,
-            "{},{},{},{:.3},{:.3},{:.4},{},{:.3}",
-            w.track_id,
-            w.start_frame,
-            w.end_frame,
-            w.start_t,
-            w.end_t,
-            w.immobile_prob,
-            match w.label {
-                crate::classify::ActClass::Immobile => "immobile",
-                crate::classify::ActClass::Mobile => "mobile",
-            },
-            w.rii
-        )?;
-        for v in &w.values {
-            write!(f, ",{v:.5}")?;
-        }
-        writeln!(f)?;
-    }
+    write_window_rows(&mut f, windows)?;
     info!("wrote {}", path.display());
     Ok(())
 }

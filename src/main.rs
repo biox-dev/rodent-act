@@ -323,6 +323,7 @@ fn main() -> anyhow::Result<()> {
                 threads,
                 max_frames,
                 preview_every,
+                live_scoring: None,
             };
             let info = pipeline::run(&cfg)?;
             println!(

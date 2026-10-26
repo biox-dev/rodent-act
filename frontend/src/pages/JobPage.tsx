@@ -4,7 +4,7 @@ import { api, type LogRecord, type ScoredWindow } from '../api';
 import SeriesChart from '../components/SeriesChart';
 import Timeline from '../components/Timeline';
 import { TrackingOverlay } from '../components/TrackingOverlay';
-import { isTerminal, useAnalysis, useFrameStream, useJobEvents } from '../hooks';
+import { isTerminal, useAnalysis, useFrameStream, useJobEvents, useLiveWindows } from '../hooks';
 
 function fmtTime(ms: number): string {
   return new Date(ms).toLocaleTimeString();
@@ -22,7 +22,11 @@ export default function JobPage() {
   const frames = useFrameStream(id, running);
 
   const done = job?.status === 'done';
-  const analysis = useAnalysis(id, done);
+  const live = useLiveWindows(id, running);
+  // Per-frame boxes only exist after the tracking pass finishes.
+  const analysis = useAnalysis(id, !!job && !running);
+  const windows = live.windows;
+  const hasWindows = windows.length > 0;
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -60,10 +64,9 @@ export default function JobPage() {
   }, [done, refresh]);
 
   const speedIndex = useMemo(() => {
-    const names = analysis.windows?.feature_names ?? [];
-    const i = names.indexOf(speedFeature);
+    const i = live.featureNames.indexOf(speedFeature);
     return i >= 0 ? i : 0;
-  }, [analysis.windows, speedFeature]);
+  }, [live.featureNames, speedFeature]);
 
   const logs: LogRecord[] = useMemo(() => {
     // The SSE stream replays the buffered log at connect; on reconnect the
@@ -239,12 +242,15 @@ export default function JobPage() {
         <div className="card">
           <h3>
             窗口时间轴
-            <span className="sub">点击色块跳转到该窗口</span>
+            <span className="sub">
+              点击色块跳转到该窗口
+              {running && hasWindows && ` · 实时累计 ${windows.length} 个窗口`}
+            </span>
           </h3>
-          {analysis.windows ? (
+          {hasWindows ? (
             <>
               <Timeline
-                windows={analysis.windows.windows}
+                windows={windows}
                 duration={job?.summary?.duration_s ?? 0}
                 current={currentTime}
                 onSeek={seek}
@@ -258,17 +264,40 @@ export default function JobPage() {
               )}
             </>
           ) : (
-            <div className="empty">{done ? '加载中…' : '分析完成后显示'}</div>
+            <div className="empty">
+              {running ? (
+                <>
+                  <span className="spinner" /> 等待首个窗口 ({Math.round(progress.progress * 100)}%)
+                </>
+              ) : (
+                '暂无窗口数据'
+              )}
+            </div>
           )}
 
           <h3 style={{ marginTop: 22 }}>
             不动概率曲线
-            <span className="sub">每窗口 p(immobile)，虚线=0.5 判定阈值</span>
+            <span className="sub">
+              每窗口 p(immobile)，虚线=0.5 判定阈值{running && !live.complete ? ' · 实时增长' : ''}
+            </span>
           </h3>
-          {analysis.windows ? (
-            <SeriesChart mode="prob" windows={analysis.windows.windows} current={currentTime} />
+          {hasWindows ? (
+            <SeriesChart
+              mode="prob"
+              windows={windows}
+              duration={job?.summary?.duration_s}
+              current={running ? undefined : currentTime}
+            />
           ) : (
-            <div className="empty">{done ? '加载中…' : '分析完成后显示'}</div>
+            <div className="empty">
+              {running ? (
+                <>
+                  <span className="spinner" /> 分析进行中，窗口完成后即时绘制
+                </>
+              ) : (
+                '暂无窗口数据'
+              )}
+            </div>
           )}
         </div>
       </div>
@@ -277,15 +306,17 @@ export default function JobPage() {
         <div className="card">
           <h3>
             轨迹特征曲线
-            <span className="sub">按窗口绘制任一特征，用于核对分类依据</span>
+            <span className="sub">
+              按窗口绘制任一特征，用于核对分类依据{running && !live.complete ? ' · 实时增长' : ''}
+            </span>
           </h3>
-          {analysis.windows ? (
+          {hasWindows ? (
             <>
               <div className="row" style={{ marginBottom: 10 }}>
                 <label className="field">
                   特征
                   <select value={speedFeature} onChange={(e) => setSpeedFeature(e.target.value)}>
-                    {analysis.windows.feature_names.map((n) => (
+                    {live.featureNames.map((n) => (
                       <option key={n} value={n}>
                         {n}
                       </option>
@@ -296,12 +327,15 @@ export default function JobPage() {
               <SeriesChart
                 mode="speed"
                 featureIndex={speedIndex}
-                windows={analysis.windows.windows}
-                current={currentTime}
+                windows={windows}
+                duration={job?.summary?.duration_s}
+                current={running ? undefined : currentTime}
               />
             </>
           ) : (
-            <div className="empty">分析完成后显示</div>
+            <div className="empty">
+              {running ? '分析进行中，窗口完成后即时绘制' : '暂无窗口数据'}
+            </div>
           )}
 
           {job?.summary && job.summary.per_track.length > 0 && (
@@ -358,7 +392,11 @@ export default function JobPage() {
           <h3 style={{ marginTop: 20 }}>
             窗口明细
             <span className="sub">
-              {analysis.windows ? `${analysis.windows.windows.length} 行` : '—'}
+              {hasWindows
+                ? `${windows.length} 行${running ? ' · 实时追加' : ''}`
+                : running
+                  ? '分析进行中…'
+                  : '—'}
             </span>
           </h3>
           <div className="feature-table-wrap">
@@ -374,7 +412,8 @@ export default function JobPage() {
                 </tr>
               </thead>
               <tbody>
-                {analysis.windows?.windows.slice(0, 500).map((w) => (
+                {/* Newest first while running, so the growing tail stays visible. */}
+                {(running ? windows.slice(-200).reverse() : windows.slice(0, 500)).map((w) => (
                   <tr
                     key={`${w.track_id}-${w.start_frame}`}
                     onClick={() => {
