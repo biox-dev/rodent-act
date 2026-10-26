@@ -26,6 +26,12 @@ pub struct YoloDetector {
     pub max_det: usize,
     /// Vertical flip augmentation (top-down rigs mounted upside down).
     pub flip_vertical: bool,
+    /// Network input `(width, height)` as baked into the ONNX graph.
+    ///
+    /// Ultralytics exports a **static** input shape (the `imgsz` used during
+    /// export), so this cannot be assumed to be 640 - a model trained/exported
+    /// at 480 will reject a 640 tensor. `0` means the axis is dynamic.
+    pub input_wh: (u32, u32),
 }
 
 impl YoloDetector {
@@ -71,6 +77,21 @@ impl YoloDetector {
             .map(|o| o.name().to_string())
             .context("model has no outputs")?;
 
+        // Read the static input size from the graph (NCHW). `0`/-1 means the
+        // axis is dynamic.
+        let input_wh = session
+            .inputs()
+            .first()
+            .map(|i| match i.dtype() {
+                ort::value::ValueType::Tensor { shape, .. } => {
+                    let w = shape.get(3).copied().unwrap_or(0);
+                    let h = shape.get(2).copied().unwrap_or(0);
+                    (w.max(0) as u32, h.max(0) as u32)
+                }
+                _ => (0, 0),
+            })
+            .unwrap_or((0, 0));
+
         // Ultralytics stores the class list in the ONNX metadata as a Python
         // dict literal: `names = {0: 'mouse', 1: 'animal'}`. Reading it here
         // means a fine-tuned model needs no extra configuration.
@@ -86,7 +107,17 @@ impl YoloDetector {
             iou_thr,
             max_det,
             flip_vertical: false,
+            input_wh,
         })
+    }
+
+    /// Network input size, with a 640 fallback for dynamic-shape exports.
+    pub fn net_wh(&self) -> (u32, u32) {
+        if self.input_wh.0 > 0 && self.input_wh.1 > 0 {
+            self.input_wh
+        } else {
+            (640, 640)
+        }
     }
 
     /// Set the class name list (usually parsed from ONNX metadata `names`).

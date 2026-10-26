@@ -29,7 +29,6 @@ fn main() -> anyhow::Result<()> {
         image::ColorType::Rgb8,
     )?;
 
-    let lb = preprocess::LetterboxCfg::new(f.width, f.height, 640, 640);
     let mut det = detect::YoloDetector::load(
         std::path::Path::new(&model),
         score_thr,
@@ -37,6 +36,9 @@ fn main() -> anyhow::Result<()> {
         300,
         4,
     )?;
+    let (net_w, net_h) = det.net_wh();
+    let lb = preprocess::LetterboxCfg::new(f.width, f.height, net_w, net_h);
+    println!("network input: {net_w}x{net_h}");
     let names: Vec<String> = if det.class_names.is_empty() {
         detect::COCO_NAMES.iter().map(|s| s.to_string()).collect()
     } else {

@@ -150,10 +150,6 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
     let fps = reader.fps;
     info!(width = w, height = h, fps, "decoding input");
 
-    // The network runs at 640x640 by default; geometry is fixed per video.
-    let net_side = 640u32;
-    let lb = LetterboxCfg::new(w, h, net_side, net_side);
-
     // --- detector backend -------------------------------------------------
     let mut yolo = if cfg.detector == DetectorKind::Yolo {
         let mut d = YoloDetector::load(&cfg.model, cfg.score_thr, cfg.iou_thr, 100, cfg.threads)?;
@@ -185,6 +181,17 @@ pub fn run(cfg: &PipelineConfig) -> Result<RunInfo> {
     } else {
         yolo.as_ref().map(|(_, c)| *c).unwrap_or(usize::MAX)
     };
+
+    // The network input size comes from the ONNX graph (Ultralytics exports a
+    // static shape = the `imgsz` used at export time), falling back to 640.
+    let (net_w, net_h) = yolo
+        .as_ref()
+        .map(|(d, _)| d.net_wh())
+        .unwrap_or((640, 640));
+    let lb = LetterboxCfg::new(w, h, net_w, net_h);
+    if cfg.detector == DetectorKind::Yolo {
+        info!(net_w, net_h, "network input size");
+    }
 
     let mut blob: Option<BlobDetector> = if cfg.detector == DetectorKind::Blob {
         let mut b = BlobDetector::new(w, h);
