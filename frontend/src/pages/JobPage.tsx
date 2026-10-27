@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { api, type LogRecord, type ScoredWindow } from '../api';
 import SeriesChart from '../components/SeriesChart';
 import Timeline from '../components/Timeline';
+import { fmtClock } from '../components/ClipRange';
 import { TrackingOverlay } from '../components/TrackingOverlay';
 import { isTerminal, useAnalysis, useFrameStream, useJobEvents, useLiveWindows } from '../hooks';
 
@@ -37,9 +38,20 @@ export default function JobPage() {
   // Tracks only start after `min_hits` detections, so the first frames are
   // empty; hold the newest known boxes (or the first ones) so the overlay
   // never flickers off at the very start of the video.
+  //
+  // Everything the pipeline reports (frame indices, window times) is relative
+  // to the analysed clip, while this player shows the original file - so all
+  // lookups subtract `clipStart`.
+  const clipStart = job?.start_s ?? analysis.records?.start_s ?? 0;
+  const clipEnd = job?.end_s ?? analysis.records?.end_s ?? null;
+  const clipDuration = job?.summary?.duration_s ?? 0;
+  const clipTime = currentTime - clipStart;
+  const inClip =
+    clipTime >= -0.05 && (clipEnd === null || currentTime <= clipEnd + 0.05);
   const fps = job?.summary?.fps ?? analysis.records?.fps ?? 25;
-  const frameIndex = Math.round(currentTime * fps);
+  const frameIndex = Math.max(0, Math.round(clipTime * fps));
   const frameRecords = useMemo(() => {
+    if (!inClip) return undefined;
     const exact = analysis.byFrame.get(frameIndex);
     if (exact) return exact;
     for (let back = 1; back <= Math.round(fps); back++) {
@@ -48,14 +60,17 @@ export default function JobPage() {
     }
     const keys = [...analysis.byFrame.keys()].sort((a, b) => a - b);
     return keys.length > 0 ? analysis.byFrame.get(keys[0]) : undefined;
-  }, [analysis.byFrame, frameIndex, fps]);
+  }, [analysis.byFrame, frameIndex, fps, inClip]);
 
-  const seek = useCallback((t: number) => {
-    const v = videoRef.current;
-    if (!v) return;
-    v.currentTime = Math.min(Math.max(t, 0), v.duration || t);
-    void v.play();
-  }, []);
+  const seek = useCallback(
+    (t: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      v.currentTime = Math.min(Math.max(clipStart + t, 0), v.duration || t);
+      void v.play();
+    },
+    [clipStart],
+  );
 
   useEffect(() => {
     if (!done) return;
@@ -174,6 +189,11 @@ export default function JobPage() {
           <div className="stat">
             <div className="label">视频时长</div>
             <div className="value">{job.summary.duration_s.toFixed(1)}s</div>
+            {(job.summary.start_s > 0.01 || job.summary.end_s != null) && (
+              <div className="muted" style={{ fontSize: 10 }}>
+                原 {job.summary.source_duration_s.toFixed(1)}s
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -183,7 +203,13 @@ export default function JobPage() {
           <h3>
             视频
             <span className="sub">
-              {running ? '实时标注流（分析进行中）' : '原始视频 + 检测框叠加'}
+              {running
+                ? '实时标注流（分析进行中）'
+                : clipStart > 0.01 || clipEnd !== null
+                  ? `原始视频 + 检测框叠加 · 分析区间 ${fmtClock(clipStart)}–${fmtClock(
+                      clipEnd ?? job?.summary?.source_duration_s ?? 0,
+                    )}`
+                  : '原始视频 + 检测框叠加'}
             </span>
           </h3>
           <div className="video-stage">
@@ -211,7 +237,7 @@ export default function JobPage() {
                   records={frameRecords}
                   videoWidth={analysis.records?.width ?? job?.summary?.width ?? 0}
                   videoHeight={analysis.records?.height ?? job?.summary?.height ?? 0}
-                  visible={running === false && !!analysis.records}
+                  visible={running === false && !!analysis.records && inClip}
                 />
               </>
             )}
@@ -225,6 +251,7 @@ export default function JobPage() {
             <div className="transport">
               <span className="mono">
                 {currentTime.toFixed(2)}s · frame {frameIndex}
+                {!inClip && ' · 不在分析区间'}
               </span>
               {frameRecords && frameRecords.length > 0 ? (
                 <span className="mono">
@@ -251,8 +278,8 @@ export default function JobPage() {
             <>
               <Timeline
                 windows={windows}
-                duration={job?.summary?.duration_s ?? 0}
-                current={currentTime}
+                duration={clipDuration}
+                current={Math.max(0, Math.min(clipTime, clipDuration || clipTime))}
                 onSeek={seek}
               />
               {selectedWindow && (
@@ -285,8 +312,8 @@ export default function JobPage() {
             <SeriesChart
               mode="prob"
               windows={windows}
-              duration={job?.summary?.duration_s}
-              current={running ? undefined : currentTime}
+              duration={clipDuration}
+              current={running ? undefined : Math.max(0, clipTime)}
             />
           ) : (
             <div className="empty">
@@ -328,8 +355,8 @@ export default function JobPage() {
                 mode="speed"
                 featureIndex={speedIndex}
                 windows={windows}
-                duration={job?.summary?.duration_s}
-                current={running ? undefined : currentTime}
+                duration={clipDuration}
+                current={running ? undefined : Math.max(0, clipTime)}
               />
             </>
           ) : (

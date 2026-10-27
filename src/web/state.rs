@@ -191,6 +191,8 @@ pub struct Job {
     pub id: String,
     pub input: PathBuf,
     pub input_name: String,
+    /// Time window of `input` that is being analysed (`None` = whole file).
+    pub clip: Option<crate::video_io::Clip>,
     pub status: RwLock<JobStatus>,
     pub error: RwLock<Option<String>>,
     pub created_ms: u64,
@@ -231,6 +233,10 @@ pub struct JobView {
     pub id: String,
     pub input: String,
     pub input_name: String,
+    /// Source-time offset of the first analysed frame (seconds).
+    pub start_s: f64,
+    /// Requested source-time end of the analysed window (seconds).
+    pub end_s: Option<f64>,
     pub status: JobStatus,
     pub error: Option<String>,
     pub created_ms: u64,
@@ -248,7 +254,12 @@ pub struct SummaryView {
     pub height: u32,
     pub fps: f64,
     pub frames: usize,
+    /// Duration of the analysed clip.
     pub duration_s: f64,
+    /// Source-time offset of the first analysed frame (seconds).
+    pub start_s: f64,
+    pub end_s: Option<f64>,
+    pub source_duration_s: f64,
     pub n_tracks: usize,
     pub n_windows: usize,
     pub immobile_windows: usize,
@@ -302,10 +313,19 @@ impl SummaryView {
             fps: run.fps,
             frames: run.frames,
             duration_s: run.duration_s,
+            start_s: run.start_s,
+            end_s: run.end_s,
+            source_duration_s: run.source_duration_s,
             n_tracks: by_track.len(),
             n_windows,
-            immobile_windows: windows.iter().filter(|w| w.label == ActClass::Immobile).count(),
-            mobile_windows: windows.iter().filter(|w| w.label == ActClass::Mobile).count(),
+            immobile_windows: windows
+                .iter()
+                .filter(|w| w.label == ActClass::Immobile)
+                .count(),
+            mobile_windows: windows
+                .iter()
+                .filter(|w| w.label == ActClass::Mobile)
+                .count(),
             mean_immobile_prob: if n_windows == 0 {
                 0.0
             } else {
@@ -342,7 +362,11 @@ impl Job {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let run = self.run.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let live_windows = self.windows.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let live_windows = self
+            .windows
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // Live stats: the summary is derived from whatever has been scored so
         // far, so the header tiles update while the job is still running and
         // are identical to the final report once `report` is set.
@@ -366,6 +390,8 @@ impl Job {
             id: self.id.clone(),
             input: self.input.display().to_string(),
             input_name: self.input_name.clone(),
+            start_s: self.clip.map(|c| c.start_s).unwrap_or(0.0),
+            end_s: self.clip.and_then(|c| c.end_s),
             status: self.status(),
             error: self.error.read().unwrap_or_else(|e| e.into_inner()).clone(),
             created_ms: self.created_ms,
@@ -459,7 +485,10 @@ impl LiveCsv {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         {
             use std::io::Write as _;
-            write!(f, "track_id,start_frame,end_frame,start_t,end_t,immobile_prob,label,rii")?;
+            write!(
+                f,
+                "track_id,start_frame,end_frame,start_t,end_t,immobile_prob,label,rii"
+            )?;
             for n in crate::features::FEATURE_NAMES {
                 write!(f, ",{n}")?;
             }

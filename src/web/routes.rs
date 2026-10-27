@@ -56,6 +56,13 @@ pub struct CreateJob {
     pub max_age: Option<usize>,
     #[serde(default)]
     pub max_frames: Option<usize>,
+    /// Source-time start of the analysed segment, in seconds (default 0).
+    #[serde(default)]
+    pub start_s: Option<f64>,
+    /// Source-time end of the analysed segment, in seconds (default: EOF).
+    /// The segment is decoded in place - no clipped file is written.
+    #[serde(default)]
+    pub end_s: Option<f64>,
     #[serde(default)]
     pub score_thr: Option<f32>,
     #[serde(default)]
@@ -375,6 +382,71 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         );
     }
 
+    // Resolve the clip window before touching the job directory: an invalid
+    // range is a client error, and the probe gives the frame rate needed to
+    // reject windows shorter than a single frame.
+    let probe = match crate::video_io::probe(&input) {
+        Ok(p) => p,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot probe media file: {e}"),
+            );
+        }
+    };
+    let source_duration = probe.duration_s;
+    let start_s = req.start_s.unwrap_or(0.0);
+    if !start_s.is_finite() || start_s < 0.0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("startS must be a non-negative number of seconds (got {start_s})"),
+        );
+    }
+    let start_s = if source_duration > 0.0 {
+        start_s.min(source_duration)
+    } else {
+        start_s
+    };
+    let end_s = match req.end_s {
+        Some(e) if !e.is_finite() => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("endS must be a finite number of seconds (got {e})"),
+            );
+        }
+        Some(e) if source_duration > 0.0 => Some(e.min(source_duration)),
+        other => other,
+    };
+    if let Some(e) = end_s
+        && e <= start_s
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("endS ({e:.2}s) must be after startS ({start_s:.2}s)"),
+        );
+    }
+    // `None` when the window covers the whole file, so the reader keeps the
+    // container's exact frame count and skips the extra ffmpeg seek options.
+    let clip = match end_s {
+        Some(e) if e < source_duration - 1e-3 => Some(crate::video_io::Clip::new(start_s, Some(e))),
+        _ if start_s > 1e-3 => Some(crate::video_io::Clip::new(start_s, None)),
+        _ => None,
+    };
+    if let Some(c) = clip
+        && source_duration > 0.0
+    {
+        let len = c.len(source_duration);
+        if len * probe.fps < 1.0 {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "clip is shorter than one frame ({len:.3}s at {:.2} fps)",
+                    probe.fps
+                ),
+            );
+        }
+    }
+
     let id = format!("j{}-{:04x}", now_ms(), rand_suffix());
     let job_dir = st.jobs.job_dir(&id);
     if let Err(e) = std::fs::create_dir_all(&job_dir) {
@@ -451,6 +523,7 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
 
     let cfg = PipelineConfig {
         input: input.clone(),
+        clip,
         output_video: video_path,
         output_json: None,
         output_csv: None,
@@ -495,6 +568,7 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         id: id.clone(),
         input_name: req.media.clone(),
         input,
+        clip,
         status: std::sync::RwLock::new(JobStatus::Queued),
         error: std::sync::RwLock::new(None),
         created_ms: now_ms(),
@@ -594,6 +668,11 @@ async fn job_records(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -
         "height": run.height,
         "fps": run.fps,
         "frames": run.frames,
+        // Frame indices/timestamps below are relative to the clip start; the
+        // UI adds `start_s` when it seeks the source video.
+        "start_s": run.start_s,
+        "end_s": run.end_s,
+        "source_duration_s": run.source_duration_s,
         "tracks": run.tracks,
         "records": run.records,
     }))
@@ -603,19 +682,12 @@ async fn job_records(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -
 /// Scored windows. Available *while the job runs*: `complete` is false until
 /// the final report exists, and `progress` tells the UI how much of the video
 /// has been scored so the curve can be drawn live.
-async fn job_windows(
-    State(st): State<AppState>,
-    UrlPath(id): UrlPath<String>,
-) -> Response {
+async fn job_windows(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
     let Some(job) = st.jobs.get(&id) else {
         return api_error(StatusCode::NOT_FOUND, "unknown job");
     };
     let report = job.report.read().ok().and_then(|g| g.clone());
-    let windows = job
-        .windows
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let windows = job.windows.read().map(|g| g.clone()).unwrap_or_default();
     let names = job
         .feature_names
         .read()
@@ -643,10 +715,7 @@ async fn job_windows(
 
 /// Live window updates. Each `windows` event carries the windows scored since
 /// the previous event, so the client appends instead of re-downloading.
-async fn job_window_events(
-    State(st): State<AppState>,
-    UrlPath(id): UrlPath<String>,
-) -> Response {
+async fn job_window_events(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
     let Some(job) = st.jobs.get(&id) else {
         return api_error(StatusCode::NOT_FOUND, "unknown job");
     };
@@ -707,7 +776,6 @@ fn window_event(windows: &[crate::pipeline::ScoredWindow], complete: bool) -> Ev
         .event("windows")
         .data(serde_json::to_string(&data).unwrap_or_else(|_| "{}".into()))
 }
-
 
 async fn job_logs(
     State(st): State<AppState>,

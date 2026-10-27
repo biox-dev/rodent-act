@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   api,
@@ -7,6 +7,7 @@ import {
   type ModelFile,
   type ServerInfo,
 } from '../api';
+import ClipRange, { fmtClock } from '../components/ClipRange';
 
 const VIDEO_EXT = /\.(mp4|avi|mov|mkv|webm)$/i;
 const IMAGE_EXT = /\.(png|jpe?g)$/i;
@@ -43,6 +44,14 @@ export default function NewJobPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Visual clip editor. Analysis decodes only [clipStart, clipEnd) of the
+  // source file (no intermediate clipped video is produced).
+  const previewRef = useRef<HTMLVideoElement>(null);
+  const [duration, setDuration] = useState(0);
+  const [clipStart, setClipStart] = useState(0);
+  const [clipEnd, setClipEnd] = useState(0);
+  const [previewingClip, setPreviewingClip] = useState(false);
+
   useEffect(() => {
     (async () => {
       try {
@@ -74,6 +83,40 @@ export default function NewJobPage() {
   const videos = useMemo(() => files.filter((f) => VIDEO_EXT.test(f.name)), [files]);
   const images = useMemo(() => files.filter((f) => IMAGE_EXT.test(f.name)), [files]);
 
+  // A new source file invalidates the previous selection; the metadata handler
+  // below resets the range once the duration is known.
+  useEffect(() => {
+    setPreviewingClip(false);
+    setDuration(0);
+    setClipStart(0);
+    setClipEnd(0);
+  }, [media]);
+
+  const seekPreview = (t: number) => {
+    const v = previewRef.current;
+    if (!v || !Number.isFinite(t)) return;
+    setPreviewingClip(false);
+    v.currentTime = Math.min(Math.max(t, 0), duration || t);
+  };
+
+  const playSelection = () => {
+    const v = previewRef.current;
+    if (!v || duration <= 0) return;
+    v.currentTime = clipStart;
+    setPreviewingClip(true);
+    void v.play().catch(() => setPreviewingClip(false));
+  };
+
+  const setEdgeFromCurrent = (edge: 'start' | 'end') => {
+    const v = previewRef.current;
+    if (!v) return;
+    const t = Math.min(Math.max(v.currentTime, 0), duration);
+    if (edge === 'start') setClipStart(Math.min(t, clipEnd - 0.05));
+    else setClipEnd(Math.max(t, clipStart + 0.05));
+  };
+
+  const wholeVideo = duration > 0 && clipStart <= 0.01 && clipEnd >= duration - 0.01;
+
   const submit = async () => {
     if (!media) {
       setError('请选择输入视频');
@@ -83,6 +126,10 @@ export default function NewJobPage() {
     setError(null);
     const body: CreateJobRequest = {
       media,
+      // Omit a full-range selection so the server keeps the container's exact
+      // frame count (and skips the extra ffmpeg seek options).
+      startS: duration > 0 && clipStart > 0.01 ? clipStart : undefined,
+      endS: duration > 0 && clipEnd < duration - 0.01 ? clipEnd : undefined,
       detector,
       reference: reference || undefined,
       blobThreshold,
@@ -147,7 +194,133 @@ export default function NewJobPage() {
       </div>
 
       <div className="card">
-        <h3>2. 检测与追踪参数</h3>
+        <h3>
+          2. 选择分析区间
+          <span className="sub">
+            拖动下方手柄或直接输入时间，只分析选中的片段
+            {wholeVideo ? ' · 当前为整段视频' : ` · ${fmtClock(clipStart)} – ${fmtClock(clipEnd)}`}
+          </span>
+        </h3>
+        {media ? (
+          <>
+            <div className="clip-layout">
+              <div className="clip-preview">
+                <video
+                  key={media}
+                  ref={previewRef}
+                  src={api.mediaUrl(media)}
+                  muted
+                  playsInline
+                  controls
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const d = Number.isFinite(e.currentTarget.duration)
+                      ? e.currentTarget.duration
+                      : 0;
+                    setDuration(d);
+                    setClipStart(0);
+                    setClipEnd(d);
+                  }}
+                  onTimeUpdate={(e) => {
+                    if (previewingClip && e.currentTarget.currentTime >= clipEnd - 0.02) {
+                      e.currentTarget.pause();
+                      setPreviewingClip(false);
+                    }
+                  }}
+                />
+              </div>
+              <div className="clip-controls">
+                <div className="row">
+                  <label className="field">
+                    起点 (s)
+                    <input
+                      type="number"
+                      min={0}
+                      max={Math.max(clipEnd - 0.05, 0)}
+                      step={0.1}
+                      value={Number(clipStart.toFixed(2))}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        if (!Number.isFinite(v)) return;
+                        setClipStart(Math.min(Math.max(v, 0), Math.max(clipEnd - 0.05, 0)));
+                        seekPreview(v);
+                      }}
+                    />
+                  </label>
+                  <label className="field">
+                    终点 (s)
+                    <input
+                      type="number"
+                      min={Math.min(clipStart + 0.05, duration)}
+                      max={duration || undefined}
+                      step={0.1}
+                      value={Number(clipEnd.toFixed(2))}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        if (!Number.isFinite(v)) return;
+                        setClipEnd(Math.min(Math.max(v, clipStart + 0.05), duration || v));
+                        seekPreview(v);
+                      }}
+                    />
+                  </label>
+                </div>
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button className="ghost" onClick={playSelection} disabled={duration <= 0}>
+                    ▶ 预览选区
+                  </button>
+                  <button
+                    className="ghost"
+                    onClick={() => {
+                      setClipStart(0);
+                      setClipEnd(duration);
+                      seekPreview(0);
+                    }}
+                    disabled={duration <= 0}
+                  >
+                    整段视频
+                  </button>
+                  <button
+                    className="ghost"
+                    onClick={() => setEdgeFromCurrent('start')}
+                    disabled={duration <= 0}
+                  >
+                    当前设为起点
+                  </button>
+                  <button
+                    className="ghost"
+                    onClick={() => setEdgeFromCurrent('end')}
+                    disabled={duration <= 0}
+                  >
+                    当前设为终点
+                  </button>
+                </div>
+                <div className="hint" style={{ marginTop: 10, fontSize: 11 }}>
+                  分析直接从该区间解码（ffmpeg 输入 seek + 限时），<b>不会</b>生成中间视频文件，
+                  因此没有二次转码的画质损失和时间开销。所有窗口时间、帧号都相对区间起点从 0 开始。
+                </div>
+              </div>
+            </div>
+            <ClipRange
+              duration={duration}
+              start={clipStart}
+              end={clipEnd}
+              onChange={(s, e) => {
+                setClipStart(s);
+                setClipEnd(e);
+              }}
+              onScrub={(t) => {
+                const v = previewRef.current;
+                if (v) v.currentTime = Math.min(Math.max(t, 0), duration || t);
+              }}
+            />
+          </>
+        ) : (
+          <div className="empty">先在上方选择一个视频</div>
+        )}
+      </div>
+
+      <div className="card">
+        <h3>3. 检测与追踪参数</h3>
         <div className="row">
           <label className="field">
             检测后端
@@ -168,7 +341,7 @@ export default function NewJobPage() {
             空场参考图（强烈推荐）
             <select value={reference} onChange={(e) => setReference(e.target.value)}>
               <option value="">不使用（时间背景）</option>
-              <option value="frame:0">视频第 0 帧</option>
+              <option value="frame:0">分析区间第 0 帧</option>
               {images.map((f) => (
                 <option key={f.name} value={f.name}>
                   {f.name}
@@ -312,7 +485,7 @@ export default function NewJobPage() {
 
       <div className="card">
         <h3>
-          3. 窗口与分类
+          4. 窗口与分类
           <span className="sub">默认 0.5 s 窗口 / 50% 重叠，无模型时使用速度阈值基线</span>
         </h3>
         <div className="row">

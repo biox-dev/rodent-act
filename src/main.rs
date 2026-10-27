@@ -122,6 +122,15 @@ enum Command {
         #[arg(long)]
         max_frames: Option<usize>,
 
+        /// Start of the analysed segment, in seconds.
+        #[arg(long)]
+        start: Option<f64>,
+
+        /// End of the analysed segment, in seconds (defaults to end of file).
+        /// The segment is decoded in place; no clipped file is written.
+        #[arg(long)]
+        end: Option<f64>,
+
         /// Print an ASCII preview every N frames.
         #[arg(long)]
         preview_every: Option<usize>,
@@ -222,6 +231,14 @@ enum Command {
         #[arg(long)]
         max_frames: Option<usize>,
 
+        /// Start of the analysed segment, in seconds.
+        #[arg(long)]
+        start: Option<f64>,
+
+        /// End of the analysed segment, in seconds (defaults to end of file).
+        #[arg(long)]
+        end: Option<f64>,
+
         /// Draw the analysis (per-window state) into the video.
         #[arg(long, default_value_t = true)]
         annotate: bool,
@@ -259,6 +276,31 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         max_side: u32,
     },
+}
+
+/// Build a clip from `--start`/`--end`, rejecting inverted or empty windows.
+fn parse_clip(start: Option<f64>, end: Option<f64>) -> anyhow::Result<Option<video_io::Clip>> {
+    let start = start.unwrap_or(0.0);
+    if !start.is_finite() || start < 0.0 {
+        anyhow::bail!("--start must be a non-negative number of seconds (got {start})");
+    }
+    match end {
+        Some(end) if !end.is_finite() => {
+            anyhow::bail!("--end must be a finite number of seconds (got {end})")
+        }
+        Some(end) if end <= start => {
+            anyhow::bail!("--end ({end}s) must be after --start ({start}s)")
+        }
+        Some(end) => Ok(Some(video_io::Clip {
+            start_s: start,
+            end_s: Some(end),
+        })),
+        None if start > 0.0 => Ok(Some(video_io::Clip {
+            start_s: start,
+            end_s: None,
+        })),
+        None => Ok(None),
+    }
 }
 
 /// `frame:12` -> use video frame 12, anything else is treated as an image path.
@@ -318,6 +360,8 @@ fn main() -> anyhow::Result<()> {
             no_trails,
             no_video,
             max_frames,
+            start,
+            end,
             preview_every,
             threads,
             device,
@@ -325,6 +369,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let cfg = PipelineConfig {
                 input,
+                clip: parse_clip(start, end)?,
                 output_video: Some(output),
                 output_json: json,
                 output_csv: csv,
@@ -391,10 +436,13 @@ fn main() -> anyhow::Result<()> {
             device,
             gpu_device,
             max_frames,
+            start,
+            end,
             annotate,
         } => {
             let track = PipelineConfig {
                 input,
+                clip: parse_clip(start, end)?,
                 output_video: annotate.then_some(output),
                 output_json: None,
                 output_csv: None,
@@ -501,10 +549,7 @@ fn run_server(
     };
     // The embedded copy is the default; `--frontend` only overrides it when the
     // directory actually contains a build.
-    let frontend = frontend
-        .join("index.html")
-        .is_file()
-        .then_some(frontend);
+    let frontend = frontend.join("index.html").is_file().then_some(frontend);
     if frontend.is_none() {
         if rodent_act::web::assets::is_embedded() {
             tracing::info!(

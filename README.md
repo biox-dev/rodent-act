@@ -175,6 +175,13 @@ cp onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0 models/libonnxrunti
   -i media/synthetic_mice.mp4 --reference media/empty_ref.png \
   --windows out/windows.csv -o out/analyzed.mp4
 
+# 4c) 只分析视频中的一段（秒）。区间在解码器里生效，不会生成中间视频：
+#     ffmpeg -ss <start> -i <input> -t <end-start>
+#     帧号与窗口时间都相对区间起点从 0 开始。
+./target/release/rodent-act analyze \
+  -i media/synthetic_mice.mp4 --start 12.5 --end 42 \
+  --windows out/windows.csv -o out/analyzed.mp4
+
 # 5) 使用 YOLO 后端
 export ORT_DYLIB_PATH=models/libonnxruntime.so 
 ./target/release/rodent-act track \
@@ -282,7 +289,7 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 
 | 路由 | 内容 |
 |---|---|
-| `/` | 选择视频 + 参数（检测后端、空场参考、bob 阈值、min_hits、窗口长度、XGB 模型） |
+| `/` | 选择视频与**分析区间**（拖动手柄或输入起止时间，只解码选中的片段）+ 参数（检测后端、空场参考、bob 阈值、min_hits、窗口长度、XGB 模型） |
 | `/jobs` | 任务列表：状态、进度、轨迹数、不动比例、耗时（每 3 s 刷新） |
 | `/jobs/:id` | 运行中：SSE 标注帧流 + 进度条 + 实时日志；完成后：视频 + 检测框叠加（Canvas）、窗口时间轴（点击跳转）、`p(immobile)` 曲线、任意特征曲线、每条轨迹统计、窗口明细表 |
 
@@ -295,7 +302,7 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 | `GET` | `/info` | 版本、目录、ffmpeg 可用性、特征名 |
 | `GET` | `/media` | 媒体目录中的视频/图片 |
 | `GET` | `/media/{name}` | 支持 `Range` 的视频流（`<video>` 拖动所需） |
-| `POST` | `/jobs` | 创建任务 `{"media": "...", "detector": "blob", "reference": "empty_ref.png", ...}` |
+| `POST` | `/jobs` | 创建任务 `{"media": "...", "startS": 10, "endS": 40, "detector": "blob", "reference": "empty_ref.png", ...}`（`startS`/`endS` 为源视频秒数，省略即整段） |
 | `GET` | `/jobs` / `/jobs/{id}` | 任务列表 / 详情（含 summary） |
 | `POST` | `/jobs/{id}/cancel` | 取消运行中的任务 |
 | `GET` | `/jobs/{id}/events` | **SSE**：`log` / `progress` / `status` / `done` |

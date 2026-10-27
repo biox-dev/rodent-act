@@ -36,7 +36,14 @@ export interface SummaryView {
   height: number;
   fps: number;
   frames: number;
+  /** Duration of the analysed clip (not of the source file). */
   duration_s: number;
+  /** Source-time offset of the first analysed frame. */
+  start_s: number;
+  /** Requested source-time end of the analysed clip, if any. */
+  end_s: number | null;
+  /** Duration of the source file, ignoring the clip. */
+  source_duration_s: number;
   n_tracks: number;
   n_windows: number;
   immobile_windows: number;
@@ -50,6 +57,10 @@ export interface JobView {
   id: string;
   input: string;
   input_name: string;
+  /** Source-time offset of the first analysed frame (seconds). */
+  start_s: number;
+  /** Requested source-time end of the analysed clip (seconds). */
+  end_s: number | null;
   status: JobStatus;
   error: string | null;
   created_ms: number;
@@ -89,6 +100,10 @@ export interface RecordsResponse {
   height: number;
   fps: number;
   frames: number;
+  /** Frame indices/times below are relative to this source offset. */
+  start_s: number;
+  end_s: number | null;
+  source_duration_s: number;
   tracks: TrackSummary[];
   records: DetectionRecord[];
 }
@@ -136,6 +151,10 @@ export interface LogsResponse {
 
 export interface CreateJobRequest {
   media: string;
+  /** Start of the analysed segment, in source seconds. */
+  startS?: number;
+  /** End of the analysed segment, in source seconds (default: EOF). */
+  endS?: number;
   detector?: 'blob' | 'yolo';
   reference?: string;
   blobThreshold?: number;

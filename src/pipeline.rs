@@ -18,7 +18,7 @@ use crate::detect::{COCO_NAMES, YoloDetector};
 use crate::draw::{self, DrawTrack, FrameOverlay};
 use crate::preprocess::LetterboxCfg;
 use crate::track::{MultiTracker, TrackerConfig};
-use crate::video_io::VideoReader;
+use crate::video_io::{Clip, VideoReader};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum DetectorKind {
@@ -31,6 +31,9 @@ pub enum DetectorKind {
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub input: PathBuf,
+    /// Decode only this time window of `input` (no intermediate file is
+    /// written; frame indices and timestamps restart at the clip start).
+    pub clip: Option<Clip>,
     pub output_video: Option<PathBuf>,
     pub output_json: Option<PathBuf>,
     pub output_csv: Option<PathBuf>,
@@ -78,6 +81,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             input: PathBuf::new(),
+            clip: None,
             output_video: None,
             output_json: None,
             output_csv: None,
@@ -141,7 +145,19 @@ pub struct RunInfo {
     pub height: u32,
     pub fps: f64,
     pub frames: usize,
+    /// Duration of the analysed clip (== `frames / fps`).
     pub duration_s: f64,
+    /// Source-time offset of the first analysed frame. Frame indices, window
+    /// times and `duration_s` are all relative to this offset, so a UI playing
+    /// the original video must add it when seeking.
+    #[serde(default)]
+    pub start_s: f64,
+    /// Requested end of the analysed clip (source seconds), if any.
+    #[serde(default)]
+    pub end_s: Option<f64>,
+    /// Duration of the source file, ignoring the clip.
+    #[serde(default)]
+    pub source_duration_s: f64,
     pub detect_calls: usize,
     pub detections: usize,
     /// Execution provider the detector ran on (`cpu`, `cuda:0`).
@@ -202,10 +218,19 @@ pub fn run_with_hook(
     mut hook: Option<&mut dyn FrameHook>,
 ) -> Result<RunInfo> {
     let started = Instant::now();
-    let mut reader = VideoReader::open(&cfg.input, cfg.max_side)?;
+    let mut reader = VideoReader::open_clipped(&cfg.input, cfg.max_side, cfg.clip)?;
     let (w, h) = (reader.width, reader.height);
     let fps = reader.fps;
-    info!(width = w, height = h, fps, "decoding input");
+    let clip_start_s = reader.start_s;
+    let source_duration_s = reader.source_duration_s;
+    info!(
+        width = w,
+        height = h,
+        fps,
+        start_s = clip_start_s,
+        duration_s = reader.duration_s,
+        "decoding input"
+    );
 
     // --- detector backend -------------------------------------------------
     let mut yolo = if cfg.detector == DetectorKind::Yolo {
@@ -287,7 +312,8 @@ pub fn run_with_hook(
     if let (Some(b), Some(reference)) = (blob.as_mut(), cfg.reference.as_ref()) {
         match reference {
             Reference::Frame(idx) => {
-                let mut ref_reader = VideoReader::open(&cfg.input, cfg.max_side)?;
+                // `idx` is relative to the analysed clip's first frame.
+                let mut ref_reader = VideoReader::open_clipped(&cfg.input, cfg.max_side, cfg.clip)?;
                 if let Some(f) = ref_reader.skip_to(*idx)? {
                     b.set_reference(&f.data);
                     info!(frame = idx, "using empty-enclosure reference frame");
@@ -355,9 +381,7 @@ pub fn run_with_hook(
     // of `all_records` that this frame produced, so the incremental result
     // matches the batch report exactly.
     let mut live = match (cfg.live_scoring.as_ref(), hook.as_ref()) {
-        (Some(analyze_cfg), Some(_)) => {
-            Some(LiveScorer::new(analyze_cfg, w, h, fps)?)
-        }
+        (Some(analyze_cfg), Some(_)) => Some(LiveScorer::new(analyze_cfg, w, h, fps)?),
         _ => None,
     };
 
@@ -579,6 +603,9 @@ pub fn run_with_hook(
         fps,
         frames: frame_count,
         duration_s: frame_count as f64 / fps,
+        start_s: clip_start_s,
+        end_s: cfg.clip.and_then(|c| c.end_s),
+        source_duration_s,
         detect_calls,
         detections: n_detections,
         device: active_device.to_string(),
@@ -668,7 +695,10 @@ fn detect_in_rois(
         }
         // `usize::MAX` is the "accept every class" sentinel (`--class-name
         // any`); comparing it directly would drop every detection.
-        out.extend(dets.into_iter().filter(|d| accept_class(class_id, d.class_id)));
+        out.extend(
+            dets.into_iter()
+                .filter(|d| accept_class(class_id, d.class_id)),
+        );
     }
     Ok(out)
 }
@@ -1030,10 +1060,7 @@ impl LiveScorer {
         let ref_size = if self.frozen.contains(&tid) {
             median_diag(slice)
         } else {
-            self.tracks
-                .get(&tid)
-                .map(|r| median_diag(r))
-                .unwrap_or(1.0)
+            self.tracks.get(&tid).map(|r| median_diag(r)).unwrap_or(1.0)
         };
         let samples: Vec<(f64, Bbox)> = slice
             .iter()
@@ -1138,7 +1165,8 @@ pub fn write_window_csv(path: &Path, names: &[String], windows: &[ScoredWindow])
 /// Reference used by the blob backend to separate animals from the enclosure.
 #[derive(Debug, Clone)]
 pub enum Reference {
-    /// Frame index inside the analysed video (empty enclosure).
+    /// Frame index inside the analysed clip (empty enclosure). Index 0 is the
+    /// first frame of the clip, not of the source file.
     Frame(usize),
     /// Path to a still image of the empty enclosure.
     Image(PathBuf),
