@@ -163,6 +163,20 @@ a {
   font-size: 13px;
 }
 
+/* Inline explanation under a form control. */
+.field .hint {
+  max-width: 230px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+
+.field .hint b {
+  color: var(--text);
+  font-weight: 600;
+}
+
 button {
   background: var(--accent);
   color: #04231a;

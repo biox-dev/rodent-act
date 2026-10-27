@@ -158,6 +158,10 @@ export default function NewJobPage() {
               <option value="blob">blob（背景差分，无需模型）</option>
               <option value="yolo">yolo（ONNX 模型）</option>
             </select>
+            <span className="hint">
+              决定每帧用什么方法找出动物。<b>blob</b> 用运动/背景差分，速度快但要求地面干净；
+              <b>yolo</b> 用神经网络，适合杂物多或已微调的场景。
+            </span>
           </label>
 
           <label className="field" style={{ minWidth: 220 }}>
@@ -171,6 +175,10 @@ export default function NewJobPage() {
                 </option>
               ))}
             </select>
+            <span className="hint">
+              箱体<b>没有动物时</b>的一张底图，用来做背景相减。有了它，动物从第 1 帧就在场也能被检出；
+              否则只能靠运动触发，静止不动的动物会漏检。
+            </span>
           </label>
 
           {detector === 'blob' ? (
@@ -184,6 +192,10 @@ export default function NewJobPage() {
                   max={120}
                   onChange={(e) => setBlobThreshold(Number(e.target.value))}
                 />
+                <span className="hint">
+                  与参考图的灰度差超过该值的像素算作“前景”。调<b>低</b>更灵敏（含噪点），
+                  调<b>高</b>更保守（可能漏掉对比度低的小鼠）。
+                </span>
               </label>
               <label className="field">
                 最小面积比例
@@ -193,6 +205,10 @@ export default function NewJobPage() {
                   value={blobMinArea}
                   onChange={(e) => setBlobMinArea(Number(e.target.value))}
                 />
+                <span className="hint">
+                  连通域面积占整帧的比例下限，用于过滤反光/阴影等小噪点。
+                  0.0015 ≈ 640×480 下约 460 像素。
+                </span>
               </label>
             </>
           ) : (
@@ -210,10 +226,18 @@ export default function NewJobPage() {
                     </option>
                   ))}
                 </select>
+                <span className="hint">
+                  要加载的 ONNX 权重。<b>mouse.onnx</b> 已在 TST 数据上微调，效果远好于
+                  通用 COCO 模型（yolo11n.onnx）。
+                </span>
               </label>
               <label className="field">
                 类别名（any = 全部）
                 <input value={className} onChange={(e) => setClassName(e.target.value)} />
+                <span className="hint">
+                  微调模型只有一个类，保留检测框即可，填 <b>any</b>；留空等价于不过滤。
+                  需要严格过滤时（如 COCO 模型只看动物），填类别名或 ID。
+                </span>
               </label>
               <label className="field">
                 置信度阈值
@@ -223,6 +247,10 @@ export default function NewJobPage() {
                   value={scoreThr}
                   onChange={(e) => setScoreThr(Number(e.target.value))}
                 />
+                <span className="hint">
+                  低于此分数的检测框直接丢弃。调低召回更高但误检更多；
+                  小鼠小、距离远时可适当降到 0.1–0.15。
+                </span>
               </label>
             </>
           )}
@@ -237,6 +265,10 @@ export default function NewJobPage() {
               step={20}
               onChange={(e) => setMaxSide(Number(e.target.value))}
             />
+            <span className="hint">
+              帧先等比缩放到最长边为该值再检测。越小越快，但小目标更易丢失；
+              640 是速度与精度的常见折中。
+            </span>
           </label>
           <label className="field">
             min_hits
@@ -246,6 +278,9 @@ export default function NewJobPage() {
               min={1}
               onChange={(e) => setMinHits(Number(e.target.value))}
             />
+            <span className="hint">
+              一条轨迹被<b>确认</b>前需连续命中该帧数。调大更抗误检，但动物刚出现的前几帧不计入。
+            </span>
           </label>
           <label className="field">
             max_age
@@ -255,6 +290,10 @@ export default function NewJobPage() {
               min={1}
               onChange={(e) => setMaxAge(Number(e.target.value))}
             />
+            <span className="hint">
+              轨迹连续丢失检测后仍保留（靠卡尔曼预测）的最大帧数。调大可跨过遮挡，
+              调小则更快结束消失的个体。
+            </span>
           </label>
           <label className="field">
             最大帧数（留空=全部）
@@ -264,6 +303,9 @@ export default function NewJobPage() {
               value={maxFrames}
               onChange={(e) => setMaxFrames(e.target.value)}
             />
+            <span className="hint">
+              只处理视频前 N 帧，便于快速试参数；留空分析整段视频。
+            </span>
           </label>
         </div>
       </div>
@@ -283,6 +325,10 @@ export default function NewJobPage() {
               min={0.1}
               onChange={(e) => setWindowS(Number(e.target.value))}
             />
+            <span className="hint">
+              把轨迹切成固定时长的小段，每段单独判定不动/活动。步长固定为窗口的一半
+              （50% 重叠），因此 0.5 s 窗口每 0.25 s 产出一个结果。TST 标准通常取 0.5 s。
+            </span>
           </label>
           <label className="field" style={{ minWidth: 240 }}>
             XGBoost 模型路径（可选）
@@ -291,8 +337,12 @@ export default function NewJobPage() {
               value={clf}
               onChange={(e) => setClf(e.target.value)}
             />
+            <span className="hint">
+              每个窗口提取速度、路径、停留比例等特征后交给该模型输出“不动”概率。
+              留空则用<b>速度阈值基线</b>：窗口平均速度 &lt; 0.30 体长/秒即判为不动。
+            </span>
           </label>
-          <label className="field checkbox">
+          <label className="field checkbox" style={{ alignSelf: 'center' }}>
             <input
               type="checkbox"
               checked={writeVideo}
@@ -300,6 +350,9 @@ export default function NewJobPage() {
             />
             同时导出标注 mp4（额外 ffmpeg 编码）
           </label>
+        </div>
+        <div className="hint" style={{ marginTop: 10, fontSize: 11 }}>
+          说明：页面上的实时标注帧不受此开关影响；勾选后会额外把整段带框视频编码成 mp4 保存到任务输出目录。
         </div>
       </div>
 
