@@ -11,7 +11,9 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-use rodent_act::{classify, detect, draw, pipeline, pipeline::PipelineConfig, track, video_io};
+use rodent_act::{
+    classify, dataset, detect, draw, pipeline, pipeline::PipelineConfig, track, video_io,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -276,6 +278,136 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         max_side: u32,
     },
+
+    /// Build a YOLO dataset from a video (extract -> autolabel -> split).
+    ///
+    /// Pure-Rust replacement for `analytics/make_dataset.py`; the same folders
+    /// can then be reviewed in the web UI (`rodent-act serve` -> 数据集).
+    Dataset {
+        #[command(subcommand)]
+        cmd: DatasetCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DatasetCommand {
+    /// Sample frames from a video into a YOLO-format folder.
+    Extract {
+        /// Input video.
+        #[arg(long)]
+        video: PathBuf,
+
+        /// Output `raw/` folder (images + empty .txt labels).
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Maximum number of sampled frames.
+        #[arg(long, default_value_t = 300)]
+        frames: usize,
+
+        /// Sampling rate in frames per second (0 = spread `--frames` evenly).
+        #[arg(long, default_value_t = 1.0)]
+        fps: f64,
+
+        /// Longest side of the stored JPEGs.
+        #[arg(long, default_value_t = 960)]
+        max_side: u32,
+
+        /// Start of the sampled segment, in source seconds.
+        #[arg(long)]
+        start: Option<f64>,
+
+        /// End of the sampled segment, in source seconds.
+        #[arg(long)]
+        end: Option<f64>,
+
+        /// JPEG quality (1-100).
+        #[arg(long, default_value_t = 92)]
+        quality: u8,
+
+        /// File-name prefix (default: the video file stem).
+        #[arg(long)]
+        prefix: Option<String>,
+
+        /// Re-encode images that already exist (labels are always kept).
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Run `autolabel` on the extracted frames afterwards.
+        #[arg(long)]
+        autolabel: bool,
+
+        /// With `--autolabel`: keep at most N boxes per frame (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        channels: usize,
+
+        /// With `--autolabel`: keep only boxes centred inside x1,y1,x2,y2
+        /// (normalised 0..1).
+        #[arg(long)]
+        roi: Option<String>,
+    },
+
+    /// Pre-fill YOLO labels with dark-region detection.
+    Autolabel {
+        /// Folder with images (e.g. `dataset/raw`).
+        #[arg(long)]
+        raw: PathBuf,
+
+        /// Darkness threshold below the frame median.
+        #[arg(long, default_value_t = 45)]
+        thresh: u8,
+
+        /// Minimum blob area as a fraction of the frame.
+        #[arg(long, default_value_t = 0.0008)]
+        min_area: f32,
+
+        /// Maximum candidate boxes per frame.
+        #[arg(long, default_value_t = 12)]
+        max_objects: usize,
+
+        /// Keep at most N boxes per frame (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        channels: usize,
+
+        /// Keep only boxes centred inside x1,y1,x2,y2 (normalised 0..1).
+        #[arg(long)]
+        roi: Option<String>,
+
+        /// Class index written to the labels.
+        #[arg(long, default_value_t = 0)]
+        class_id: usize,
+
+        /// Skip frames that already have boxes.
+        #[arg(long)]
+        only_empty: bool,
+    },
+
+    /// Copy a reviewed `raw/` folder into images/labels/{train,val} + data.yaml.
+    Split {
+        #[arg(long)]
+        raw: PathBuf,
+
+        /// Dataset root (receives `images/`, `labels/`, `data.yaml`).
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Fraction of frames used for validation.
+        #[arg(long, default_value_t = 0.2)]
+        val_frac: f32,
+
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Class name written to `data.yaml`.
+        #[arg(long, default_value = "mouse")]
+        class_name: String,
+    },
+
+    /// Validate a dataset folder (split layout if present, else `raw/`).
+    Check {
+        #[arg(long)]
+        dataset: PathBuf,
+    },
 }
 
 /// Build a clip from `--start`/`--end`, rejecting inverted or empty windows.
@@ -511,6 +643,128 @@ fn main() -> anyhow::Result<()> {
             )?;
             println!("wrote {}", output.display());
         }
+        Command::Dataset { cmd } => match cmd {
+            DatasetCommand::Extract {
+                video,
+                out,
+                frames,
+                fps,
+                max_side,
+                start,
+                end,
+                quality,
+                prefix,
+                overwrite,
+                autolabel,
+                channels,
+                roi,
+            } => {
+                let opts = dataset::ExtractOptions {
+                    video,
+                    out_dir: out.clone(),
+                    frames,
+                    fps,
+                    max_side,
+                    start_s: start,
+                    end_s: end,
+                    quality,
+                    prefix,
+                    overwrite,
+                };
+                let report = dataset::extract::extract_frames(&opts)?;
+                println!(
+                    "wrote {} frames to {} ({}x{}, {} fps source, step={} frames, skipped={})",
+                    report.written,
+                    report.out_dir,
+                    report.width,
+                    report.height,
+                    report.fps,
+                    report.step,
+                    report.skipped
+                );
+                if autolabel {
+                    let mut auto = dataset::AutolabelOptions {
+                        channels,
+                        ..Default::default()
+                    };
+                    if let Some(spec) = roi {
+                        auto.roi = Some(dataset::parse_roi(&spec)?);
+                    }
+                    let rep = dataset::autolabel::autolabel_dir(&out, &auto)?;
+                    println!(
+                        "pre-labelled {} images, {} boxes ({} empty, {} skipped)",
+                        rep.images, rep.boxes, rep.empty, rep.skipped
+                    );
+                }
+                println!("next: review the labels in `rodent-act serve` (数据集), then split");
+            }
+            DatasetCommand::Autolabel {
+                raw,
+                thresh,
+                min_area,
+                max_objects,
+                channels,
+                roi,
+                class_id,
+                only_empty,
+            } => {
+                let opts = dataset::AutolabelOptions {
+                    threshold: thresh,
+                    min_area,
+                    max_objects,
+                    channels,
+                    roi: roi.as_deref().map(dataset::parse_roi).transpose()?,
+                    class_id,
+                    only_empty,
+                    ..Default::default()
+                };
+                let rep = dataset::autolabel::autolabel_dir(&raw, &opts)?;
+                println!(
+                    "pre-labelled {} images, {} boxes ({} empty, {} skipped)",
+                    rep.images, rep.boxes, rep.empty, rep.skipped
+                );
+                println!("pre-labels are a starting point: correct them before training");
+            }
+            DatasetCommand::Split {
+                raw,
+                out,
+                val_frac,
+                seed,
+                class_name,
+            } => {
+                let opts = dataset::SplitOptions {
+                    raw_dir: raw,
+                    out_dir: out,
+                    val_frac,
+                    seed,
+                    class_name,
+                };
+                let rep = dataset::split::split_dataset(&opts)?;
+                println!("train={} val={}", rep.train, rep.val);
+                println!("wrote {}", rep.data_yaml);
+            }
+            DatasetCommand::Check { dataset } => {
+                let rep = dataset::split::check_dataset(&dataset)?;
+                println!(
+                    "scope={} images={} labels={} boxes={} empty={} problems={}",
+                    rep.scope,
+                    rep.images,
+                    rep.labeled,
+                    rep.boxes,
+                    rep.empty_images,
+                    rep.problems.len()
+                );
+                for p in rep.problems.iter().take(50) {
+                    println!("  {p}");
+                }
+                for w in &rep.warnings {
+                    println!("WARNING: {w}");
+                }
+                if !rep.ok {
+                    anyhow::bail!("dataset check failed");
+                }
+            }
+        },
     }
     Ok(())
 }

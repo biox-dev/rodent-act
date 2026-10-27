@@ -238,6 +238,10 @@ ffmpeg (子进程)              (Rust)
 | `src/features.rs` | 0.5 s 窗口特征（骨架已就位，见第 5 节） |
 | `src/classify.rs` | XGBoost 接口（骨架已就位，见第 5 节） |
 | `src/pipeline.rs` | 端到端流水线 + 统计 + JSON/CSV 导出 + `FrameHook` 逐帧回调 |
+| `src/dataset/` | **YOLO 数据集工具**：抽帧、暗区预标注（纯 Rust 形态学+连通域）、train/val 划分、校验；REST 端点见 2.5 |
+| `src/dataset/extract.rs` | 按 fps/帧数抽帧 → JPEG + 空 `.txt`（复用 `VideoReader`，不覆盖已有标注） |
+| `src/dataset/autolabel.rs` | 灰度中值阈值 → 9×9 开/闭运算 → 8 连通域 → 面积/长宽/ROI 过滤 → NMS |
+| `src/dataset/split.rs` | 随机划分拷贝 `images|labels/{train,val}`、写 `data.yaml`、校验标注文件 |
 | `src/web/` | **Axum 服务**：REST + SSE（日志/进度/标注帧）+ 前端静态托管 |
 | `src/web/assets.rs` | 编译期嵌入的前端文件表（由 `build.rs` 生成）+ 路径校验 / MIME |
 | `build.rs` | 遍历 `frontend/dist` 生成 `include_bytes!` 表，缺失时只告警不失败 |
@@ -292,6 +296,8 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 | `/` | 选择视频与**分析区间**（拖动手柄或输入起止时间，只解码选中的片段）+ 参数（检测后端、空场参考、bob 阈值、min_hits、窗口长度、XGB 模型） |
 | `/jobs` | 任务列表：状态、进度、轨迹数、不动比例、耗时（每 3 s 刷新） |
 | `/jobs/:id` | 运行中：SSE 标注帧流 + 进度条 + 实时日志；完成后：视频 + 检测框叠加（Canvas）、窗口时间轴（点击跳转）、`p(immobile)` 曲线、任意特征曲线、每条轨迹统计、窗口明细表 |
+| `/datasets` | 数据集生成：选视频 → 抽帧（帧数/fps/最长边/区间）+ 可选自动预标注（阈值、通道数、ROI）；列出已有数据集 |
+| `/datasets/:name` | 标注编辑器：帧列表（可只看空标注）、Canvas 画/拖/缩放/右键删除框、自动保存、复制上一帧、预标注、校验、划分 train/val |
 
 ### API
 
@@ -312,6 +318,15 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 | `GET` | `/jobs/{id}/windows` | 窗口特征 + 分类结果 |
 | `GET` | `/jobs/{id}/logs` | 日志快照（`?since=N` 增量拉取） |
 | `GET` | `/jobs/{id}/video` | 可选导出的标注 mp4 |
+| `GET` | `/datasets` | 数据集列表（图片/标注框/空帧数/是否已划分） |
+| `POST` | `/datasets/extract` | 抽帧 + 可选预标注 `{"media":"TST.mp4","dataset":"tst","frames":60,"fps":1,"maxSide":960,"autolabel":{"threshold":45,"channels":6,"roi":[0.1,0.1,0.98,0.95]}}` |
+| `GET` | `/datasets/{name}/frames` | 帧列表（文件名、框数、宽高） |
+| `GET` | `/datasets/{name}/image/{file}` | 数据集图片（JPEG/PNG） |
+| `GET` / `PUT` | `/datasets/{name}/labels/{file}` | 读取 / 覆盖一张图的 YOLO 标注 `{"boxes":[{"classId":0,"xc":…,"yc":…,"w":…,"h":…}]}` |
+| `POST` | `/datasets/{name}/autolabel` | 对已有帧重新预标注（可选 `onlyEmpty`） |
+| `POST` | `/datasets/{name}/split` | 划分 train/val 并写 `data.yaml`，同时返回校验结果 |
+| `POST` | `/datasets/{name}/check` | 校验标注（缺标签、字段数、越界值） |
+| `DELETE` | `/datasets/{name}` | 删除整个数据集目录 |
 
 实现要点：
 
@@ -446,7 +461,7 @@ immobile_prob, label, rii` + 18 个特征。`rii` 是文献里的经典判据
 COCO 模型不认识俯视/悬尾的白鼠（实测最高分是 `cat/bear/bowl`），必须微调。
 **几百帧标注**通常就够（YOLO11n 从预训练权重做单类微调，几十到一两百张也能出效果）。
 
-### 6.1 数据准备（`analytics/make_dataset.py`）
+### 6.1 数据准备（Rust 原生，推荐）
 
 标准 YOLO 格式，一张图一个同名 `.txt`：
 
@@ -454,31 +469,43 @@ COCO 模型不认识俯视/悬尾的白鼠（实测最高分是 `cat/bear/bowl`�
 <类 ID> <x_center> <y_center> <width> <height>     # 全部归一化到 0..1
 ```
 
-四步，每步都可单独跑：
+完整的抽帧 → 预标注 → 人工修正 → 划分，都可以直接用 Rust 完成
+（`src/dataset/`，等价于 `analytics/make_dataset.py`，无需 Python/OpenCV）：
 
 ```bash
-# ① 抽帧：按 1 fps 抽（长视频抽 300 帧约覆盖 5 分钟）
-./analytics/.venv/bin/python analytics/make_dataset.py extract \
-  --video TST.mp4 --out dataset/raw --fps 1 --frames 300 --max-side 960
-
-# ② 预标注：用"比全图中位亮度更暗"的连通域自动生成初始框
+# ① 抽帧：按 1 fps 抽 60 帧，缩放到最长边 960，并顺手跑预标注
 #    --channels 是悬尾装置通道数；--roi 限制在装置区域内（重要！）
-./analytics/.venv/bin/python analytics/make_dataset.py autolabel \
-  --raw dataset/raw --channels 6 --roi 0.20,0.12,0.95,0.92
+./target/release/rodent-act dataset extract \
+  --video TST.mp4 --out dataset/raw \
+  --frames 60 --fps 1 --max-side 960 \
+  --autolabel --channels 6 --roi 0.10,0.10,0.98,0.95
 
-# ③ 人工修正：用 labelImg / Label Studio / CVAT / Roboflow 打开 dataset/raw
-#    （预标注已经很接近，通常每帧只需 1-2 次点击的修正）
+# ② 也可以只对已有帧重新预标注（--only-empty 保留手工修正）
+./target/release/rodent-act dataset autolabel \
+  --raw dataset/raw --thresh 45 --min-area 0.0008 \
+  --channels 6 --roi 0.10,0.10,0.98,0.95
 
-# ④ 划分训练/验证集并生成 data.yaml
-./analytics/.venv/bin/python analytics/make_dataset.py split \
-  --raw dataset/raw --out dataset --val-frac 0.2
+# ③ 人工修正：浏览器里直接改（推荐）
+./target/release/rodent-act serve        # 打开「数据集」页 → 选择数据集
+#    左键拖拽画框 · 拖动框移动 · 拖四角缩放 · 右键删除 · ←/→ 切帧 · 自动保存
+#    每张图的 .txt 与 labelImg / CVAT / Label Studio 完全兼容
+
+# ④ 划分训练/验证集并生成 data.yaml（编辑器里也有按钮）
+./target/release/rodent-act dataset split \
+  --raw dataset/raw --out dataset --val-frac 0.2 --class-name mouse
 
 # ⑤ 校验（缺标签、越界、框太少都会报出来）
-./analytics/.venv/bin/python analytics/make_dataset.py check --dataset dataset
+./target/release/rodent-act dataset check --dataset dataset
 ```
 
 `--roi` 非常关键：不加的话，灯管、线缆、笼具、操作人员的手都会变成"鼠标"。
 `--channels` 直接对应装置通道数（多通道 TST 常见 4/6/12 通道）。
+
+> Web UI 生成的数据集位于 `<out-dir>/datasets/<名称>/raw/`，
+> `images/`、`labels/` 与 `data.yaml` 生成在同一目录，可直接交给下一节训练。
+
+旧的 Python 流程仍然可用（`analytics/make_dataset.py` 的
+`extract / autolabel / split / check` 与上面四个子命令一一对应）。
 
 ### 6.2 标注要点（比工具更重要）
 

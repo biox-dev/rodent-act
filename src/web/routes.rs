@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
+use crate::dataset;
 use crate::pipeline::{AnalyzeConfig, DetectorKind, PipelineConfig, Reference};
 use crate::track::TrackerConfig;
 use crate::web::state::{self, Job, JobManager, JobStatus, JobView};
@@ -995,6 +996,424 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 // --------------------------------------------------------------------------- //
+// dataset endpoints (extract / autolabel / review / split / check)
+// --------------------------------------------------------------------------- //
+
+/// Datasets live under `<out>/datasets/<name>/raw`, next to job outputs.
+fn datasets_root(st: &AppState) -> PathBuf {
+    st.jobs.out_dir().join("datasets")
+}
+
+fn dataset_dir(st: &AppState, name: &str) -> Option<PathBuf> {
+    dataset::is_safe_name(name).then(|| datasets_root(st).join(name))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutolabelRequest {
+    threshold: Option<u8>,
+    min_area: Option<f32>,
+    max_objects: Option<usize>,
+    channels: Option<usize>,
+    /// `[x1, y1, x2, y2]`, normalised 0..1.
+    roi: Option<[f32; 4]>,
+    class_id: Option<usize>,
+    only_empty: Option<bool>,
+}
+
+impl AutolabelRequest {
+    fn into_options(self) -> dataset::AutolabelOptions {
+        let d = dataset::AutolabelOptions::default();
+        dataset::AutolabelOptions {
+            threshold: self.threshold.unwrap_or(d.threshold).min(200),
+            min_area: self.min_area.unwrap_or(d.min_area).clamp(0.0, 0.9),
+            max_objects: self.max_objects.unwrap_or(d.max_objects).clamp(1, 200),
+            channels: self.channels.unwrap_or(0),
+            roi: self.roi,
+            class_id: self.class_id.unwrap_or(0),
+            only_empty: self.only_empty.unwrap_or(false),
+            nms_iou: d.nms_iou,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractDatasetRequest {
+    /// File name inside the media directory.
+    media: String,
+    /// Dataset directory name (default: the video file stem).
+    #[serde(default)]
+    dataset: Option<String>,
+    #[serde(default)]
+    frames: Option<usize>,
+    #[serde(default)]
+    fps: Option<f64>,
+    #[serde(default)]
+    max_side: Option<u32>,
+    #[serde(default)]
+    start_s: Option<f64>,
+    #[serde(default)]
+    end_s: Option<f64>,
+    #[serde(default)]
+    quality: Option<u8>,
+    #[serde(default)]
+    overwrite: Option<bool>,
+    #[serde(default)]
+    autolabel: Option<AutolabelRequest>,
+}
+
+async fn list_datasets(State(st): State<AppState>) -> Json<Vec<dataset::DatasetSummary>> {
+    let root = datasets_root(&st);
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("raw").is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            out.push(dataset::summarize(&path, &name));
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(out)
+}
+
+async fn dataset_detail(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    if !root.join("raw").is_dir() {
+        return api_error(StatusCode::NOT_FOUND, "unknown dataset");
+    }
+    Json(dataset::summarize(&root, &name)).into_response()
+}
+
+/// `POST /api/datasets/extract` - sample frames and (optionally) pre-label.
+async fn dataset_extract(
+    State(st): State<AppState>,
+    Json(req): Json<ExtractDatasetRequest>,
+) -> Response {
+    let Some(video) = safe_join(st.jobs.media_dir(), &req.media) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid media name");
+    };
+    if !video.is_file() {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("media not found: {}", req.media),
+        );
+    }
+    let stem = video
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = req
+        .dataset
+        .as_deref()
+        .map(dataset::sanitize_name)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| dataset::sanitize_name(&stem));
+    let root = datasets_root(&st).join(&name);
+    let raw = root.join("raw");
+
+    let opts = dataset::ExtractOptions {
+        video,
+        out_dir: raw.clone(),
+        frames: req.frames.unwrap_or(300).clamp(1, 100_000),
+        fps: req.fps.unwrap_or(1.0).max(0.0),
+        max_side: req.max_side.unwrap_or(960).clamp(64, 3840),
+        start_s: req.start_s.filter(|v| v.is_finite() && *v >= 0.0),
+        end_s: req.end_s.filter(|v| v.is_finite()),
+        quality: req.quality.unwrap_or(92).clamp(1, 100),
+        prefix: None,
+        overwrite: req.overwrite.unwrap_or(false),
+    };
+    let auto = req.autolabel.map(AutolabelRequest::into_options);
+
+    let worker = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(dataset::ExtractReport, Option<dataset::AutolabelReport>)> {
+            let extract = dataset::extract::extract_frames(&opts)?;
+            let autolabel = match auto {
+                Some(o) => Some(dataset::autolabel::autolabel_dir(&raw, &o)?),
+                None => None,
+            };
+            Ok((extract, autolabel))
+        },
+    )
+    .await;
+
+    match worker {
+        Ok(Ok((extract, autolabel))) => {
+            tracing::info!(
+                dataset = %name,
+                frames = extract.written,
+                boxes = autolabel.as_ref().map(|a| a.boxes).unwrap_or(0),
+                "dataset frames extracted"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "dataset": dataset::summarize(&root, &name),
+                    "extract": extract,
+                    "autolabel": autolabel,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("extract worker failed: {e}"),
+        ),
+    }
+}
+
+async fn dataset_frames(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    let raw = root.join("raw");
+    if !raw.is_dir() {
+        return api_error(StatusCode::NOT_FOUND, "unknown dataset");
+    }
+    match tokio::task::spawn_blocking(move || dataset::list_frames(&raw)).await {
+        Ok(Ok(frames)) => Json(serde_json::json!({
+            "name": name,
+            "dir": root.display().to_string(),
+            "frames": frames,
+        }))
+        .into_response(),
+        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list worker failed: {e}"),
+        ),
+    }
+}
+
+async fn dataset_image(
+    State(st): State<AppState>,
+    UrlPath((name, file)): UrlPath<(String, String)>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    let Some(path) = safe_join(&root.join("raw"), &file) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid file name");
+    };
+    if !dataset::is_image_path(&path) {
+        return api_error(StatusCode::BAD_REQUEST, "not an image file");
+    }
+    let mime = if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+    {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => api_error(StatusCode::NOT_FOUND, "frame not found"),
+    }
+}
+
+async fn dataset_get_labels(
+    State(st): State<AppState>,
+    UrlPath((name, file)): UrlPath<(String, String)>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    if !file.to_ascii_lowercase().ends_with(".txt") {
+        return api_error(StatusCode::BAD_REQUEST, "not a label file");
+    }
+    let Some(path) = safe_join(&root.join("raw"), &file) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid file name");
+    };
+    match dataset::read_labels(&path) {
+        Ok(boxes) => Json(serde_json::json!({ "boxes": boxes })).into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveLabelsRequest {
+    boxes: Vec<dataset::LabelBox>,
+}
+
+async fn dataset_put_labels(
+    State(st): State<AppState>,
+    UrlPath((name, file)): UrlPath<(String, String)>,
+    Json(body): Json<SaveLabelsRequest>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    if !file.to_ascii_lowercase().ends_with(".txt") {
+        return api_error(StatusCode::BAD_REQUEST, "not a label file");
+    }
+    let Some(path) = safe_join(&root.join("raw"), &file) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid file name");
+    };
+    if body.boxes.len() > 500 {
+        return api_error(StatusCode::BAD_REQUEST, "too many boxes (max 500)");
+    }
+    for (i, b) in body.boxes.iter().enumerate() {
+        if !b.is_valid() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("box {i} has invalid values: {b:?}"),
+            );
+        }
+    }
+    match dataset::write_labels(&path, &body.boxes) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "boxes": body.boxes.len(),
+        }))
+        .into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn dataset_autolabel(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    Json(req): Json<AutolabelRequest>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    let raw = root.join("raw");
+    if !raw.is_dir() {
+        return api_error(StatusCode::NOT_FOUND, "unknown dataset");
+    }
+    let opts = req.into_options();
+    let root_for_summary = root.clone();
+    match tokio::task::spawn_blocking(move || dataset::autolabel::autolabel_dir(&raw, &opts)).await
+    {
+        Ok(Ok(report)) => {
+            tracing::info!(
+                dataset = %name,
+                images = report.images,
+                boxes = report.boxes,
+                "dataset auto-labelled"
+            );
+            Json(serde_json::json!({
+                "report": report,
+                "dataset": dataset::summarize(&root_for_summary, &name),
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("autolabel worker failed: {e}"),
+        ),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SplitRequest {
+    val_frac: Option<f32>,
+    seed: Option<u64>,
+    class_name: Option<String>,
+}
+
+async fn dataset_split(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    Json(req): Json<SplitRequest>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    if !root.join("raw").is_dir() {
+        return api_error(StatusCode::NOT_FOUND, "unknown dataset");
+    }
+    let opts = dataset::SplitOptions {
+        raw_dir: root.join("raw"),
+        out_dir: root.clone(),
+        val_frac: req.val_frac.unwrap_or(0.2).clamp(0.01, 0.9),
+        seed: req.seed.unwrap_or(0),
+        class_name: req.class_name.unwrap_or_else(|| "mouse".to_string()),
+    };
+    let check_root = root.clone();
+    let worker = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(dataset::SplitReport, dataset::CheckReport)> {
+            let split = dataset::split::split_dataset(&opts)?;
+            let check = dataset::split::check_dataset(&check_root)?;
+            Ok((split, check))
+        },
+    )
+    .await;
+    match worker {
+        Ok(Ok((split, check))) => {
+            tracing::info!(dataset = %name, train = split.train, val = split.val, "dataset split");
+            Json(serde_json::json!({ "split": split, "check": check })).into_response()
+        }
+        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("split worker failed: {e}"),
+        ),
+    }
+}
+
+async fn dataset_check(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    match tokio::task::spawn_blocking(move || dataset::split::check_dataset(&root)).await {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("check worker failed: {e}"),
+        ),
+    }
+}
+
+async fn dataset_delete(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    if !root.is_dir() {
+        return api_error(StatusCode::NOT_FOUND, "unknown dataset");
+    }
+    match std::fs::remove_dir_all(&root) {
+        Ok(()) => {
+            tracing::info!(dataset = %name, "dataset deleted");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// --------------------------------------------------------------------------- //
 // router
 // --------------------------------------------------------------------------- //
 
@@ -1004,6 +1423,18 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
         .route("/models", get(list_models))
         .route("/media", get(list_media))
         .route("/media/{name}", get(media_file))
+        .route("/datasets", get(list_datasets))
+        .route("/datasets/extract", post(dataset_extract))
+        .route("/datasets/{name}", get(dataset_detail).delete(dataset_delete))
+        .route("/datasets/{name}/frames", get(dataset_frames))
+        .route("/datasets/{name}/image/{file}", get(dataset_image))
+        .route(
+            "/datasets/{name}/labels/{file}",
+            get(dataset_get_labels).put(dataset_put_labels),
+        )
+        .route("/datasets/{name}/autolabel", post(dataset_autolabel))
+        .route("/datasets/{name}/split", post(dataset_split))
+        .route("/datasets/{name}/check", post(dataset_check))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/cancel", post(cancel_job))

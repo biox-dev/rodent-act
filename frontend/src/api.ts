@@ -172,6 +172,119 @@ export interface CreateJobRequest {
   writeVideo?: boolean;
 }
 
+// --------------------------------------------------------------------------- //
+// dataset builder (extract / autolabel / review / split)
+// --------------------------------------------------------------------------- //
+
+/** `GET /api/datasets` - one folder under `<out>/datasets`. */
+export interface DatasetSummary {
+  name: string;
+  path: string;
+  nImages: number;
+  nBoxes: number;
+  emptyImages: number;
+  hasSplit: boolean;
+  train: number;
+  val: number;
+  modifiedMs: number;
+}
+
+export interface DatasetFrame {
+  /** Image file name (`TST_000012.jpg`). */
+  name: string;
+  /** Label file name (`TST_000012.txt`). */
+  label: string;
+  boxes: number;
+  width: number;
+  height: number;
+}
+
+export interface DatasetFramesResponse {
+  name: string;
+  dir: string;
+  frames: DatasetFrame[];
+}
+
+/** One YOLO box, normalised to 0..1 (mirrors `dataset::LabelBox`). */
+export interface LabelBox {
+  classId: number;
+  xc: number;
+  yc: number;
+  w: number;
+  h: number;
+}
+
+export interface ExtractReport {
+  outDir: string;
+  written: number;
+  skipped: number;
+  width: number;
+  height: number;
+  fps: number;
+  step: number;
+  scanned: number;
+}
+
+export interface AutolabelReport {
+  images: number;
+  boxes: number;
+  skipped: number;
+  empty: number;
+}
+
+export interface AutolabelOptions {
+  threshold?: number;
+  minArea?: number;
+  maxObjects?: number;
+  /** Keep at most N boxes per frame (0 = unlimited). */
+  channels?: number;
+  /** `[x1, y1, x2, y2]`, normalised 0..1. */
+  roi?: [number, number, number, number];
+  classId?: number;
+  onlyEmpty?: boolean;
+}
+
+export interface ExtractDatasetRequest {
+  /** File name inside the media directory. */
+  media: string;
+  /** Dataset folder name (default: the video file stem). */
+  dataset?: string;
+  frames?: number;
+  /** Sampling rate in frames per second (0 = spread `frames` evenly). */
+  fps?: number;
+  maxSide?: number;
+  startS?: number;
+  endS?: number;
+  quality?: number;
+  overwrite?: boolean;
+  autolabel?: AutolabelOptions;
+}
+
+export interface ExtractDatasetResponse {
+  dataset: DatasetSummary;
+  extract: ExtractReport;
+  autolabel: AutolabelReport | null;
+}
+
+export interface SplitReport {
+  train: number;
+  val: number;
+  outDir: string;
+  dataYaml: string;
+}
+
+export interface CheckReport {
+  root: string;
+  scope: 'split' | 'raw';
+  images: number;
+  labeled: number;
+  boxes: number;
+  emptyImages: number;
+  problems: string[];
+  warnings: string[];
+  ok: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -220,4 +333,45 @@ export const api = {
   framesUrl: (id: string) => `${BASE}/jobs/${id}/frames`,
   frameUrl: (id: string) => `${BASE}/jobs/${id}/frame`,
   videoUrl: (id: string) => `${BASE}/jobs/${id}/video`,
+
+  listDatasets: () => request<DatasetSummary[]>('/datasets'),
+  extractDataset: (body: ExtractDatasetRequest) =>
+    request<ExtractDatasetResponse>('/datasets/extract', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  datasetFrames: (name: string) =>
+    request<DatasetFramesResponse>(`/datasets/${encodeURIComponent(name)}/frames`),
+  datasetImageUrl: (name: string, file: string) =>
+    `${BASE}/datasets/${encodeURIComponent(name)}/image/${encodeURIComponent(file)}`,
+  datasetLabels: (name: string, file: string) =>
+    request<{ boxes: LabelBox[] }>(
+      `/datasets/${encodeURIComponent(name)}/labels/${encodeURIComponent(file)}`,
+    ),
+  saveDatasetLabels: (name: string, file: string, boxes: LabelBox[]) =>
+    request<{ ok: boolean; boxes: number }>(
+      `/datasets/${encodeURIComponent(name)}/labels/${encodeURIComponent(file)}`,
+      { method: 'PUT', body: JSON.stringify({ boxes }) },
+    ),
+  autolabelDataset: (name: string, opts: AutolabelOptions) =>
+    request<{ report: AutolabelReport; dataset: DatasetSummary }>(
+      `/datasets/${encodeURIComponent(name)}/autolabel`,
+      { method: 'POST', body: JSON.stringify(opts) },
+    ),
+  splitDataset: (
+    name: string,
+    opts: { valFrac?: number; seed?: number; className?: string },
+  ) =>
+    request<{ split: SplitReport; check: CheckReport }>(
+      `/datasets/${encodeURIComponent(name)}/split`,
+      { method: 'POST', body: JSON.stringify(opts) },
+    ),
+  checkDataset: (name: string) =>
+    request<CheckReport>(`/datasets/${encodeURIComponent(name)}/check`, {
+      method: 'POST',
+    }),
+  deleteDataset: (name: string) =>
+    request<{ ok: boolean }>(`/datasets/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
 };

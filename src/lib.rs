@@ -6,6 +6,7 @@
 
 pub mod classify;
 pub mod common;
+pub mod dataset;
 pub mod detect;
 pub mod draw;
 pub mod features;
