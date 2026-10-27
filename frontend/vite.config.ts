@@ -14,6 +14,31 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // The container's inotify limits are tiny (fs.inotify.max_user_watches=65536,
+    // max_user_instances=128) and node_modules alone is ~2.4k files, so a real
+    // watcher swarm blows ENOSPC. Polling avoids inotify watches entirely; the
+    // ignores keep the poller's scan cheap and skip build artifacts.
+    watch: {
+      usePolling: true,
+      interval: 300,
+      ignored: [
+        '**/node_modules/**',
+        '**/.git/**',
+        '**/dist/**',
+        '**/target/**',
+        '**/runs/**',
+        '**/dataset/**',
+        '**/media/**',
+        '**/models/**',
+        '**/*.tsbuildinfo',
+        '**/*.onnx',
+        '**/*.mp4',
+        '**/*.avi',
+        '**/*.mov',
+        '**/*.mkv',
+        '**/*.webm',
+      ],
+    },
     proxy: {
       '/api': {
         target: backend,

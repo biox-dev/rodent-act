@@ -36,8 +36,9 @@ cp onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0 models/libonnxrunti
   --windows out/windows.csv -o out/analyzed.mp4
 
 # 5) 使用 YOLO 后端
-ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act track \
-  -i media/mouse_cage_20s.mp4 --detector yolo --class-name any \
+export ORT_DYLIB_PATH=models/libonnxruntime.so 
+./target/release/rodent-act track \
+  -i media/synthetic_mice.mp4 --detector yolo --class-name any \
   -o out/yolo_tracked.mp4 --json out/yolo_tracks.json
 
 # 6) 浏览器可视化界面（实时标注帧 + 窗口时间轴，见 2.5 节）
@@ -102,7 +103,7 @@ ffmpeg (子进程)              (Rust)
 cd frontend && npm install && npm run build && cd ..
 
 # ② 编译并启动（默认 http://127.0.0.1:8080）
- ORT_DYLIB_PATH=models/libonnxruntime.so cargo run --release -- serve
+ORT_DYLIB_PATH=models/libonnxruntime.so cargo run --release -- serve
 #    ├── --addr 0.0.0.0:8080      绑定的地址
 #    ├── --media-dir media        视频选择器扫描的目录
 #    ├── --out-dir out            job 输出（CSV / 可选 mp4）
