@@ -7,7 +7,86 @@
 
 ---
 
+## 0. 前置依赖与安装
+
+### 0.1 依赖总览
+
+| 依赖 | 是否必需 | 说明 |
+|---|---|---|
+| `ffmpeg` + `ffprobe` | **必需** | 解码/编码/读取元信息，通过**子进程**调用（不链接任何 C 库） |
+| Rust 工具链（edition 2024） | 必需 | 需要 **rustc ≥ 1.85** |
+| ONNX Runtime 动态库 | 仅 `yolo` 后端 / `serve` 默认模型 | `ort` 以 `load-dynamic` 方式加载，需 `ORT_DYLIB_PATH` |
+| Node.js ≥ 18 + npm | 仅构建前端 UI | 不构建前端时二进制仍可运行，但 `serve` 没有页面 |
+| Python ≥ 3.9 + `scikit-learn` | 仅重新训练 XGBoost | 推理已由 `src/classify.rs` 原生实现，**运行期不需要 Python** |
+
+> 没有 `ffmpeg` / `ffprobe` 时，任何视频命令都会在启动阶段报
+> `failed to spawn ffmpeg (is it on PATH?)` 或 `failed to run ffprobe`，项目**没有内置降级解码器**。
+
+### 0.2 安装 ffmpeg / ffprobe
+
+两者的安装包必须**同源同版本**（`ffprobe` 通常随 `ffmpeg` 一起提供）：
+
+```bash
+# Debian / Ubuntu
+sudo apt update && sudo apt install -y ffmpeg
+
+# Fedora / RHEL / CentOS（RHEL 需先启用 EPEL + RPM Fusion）
+sudo dnf install -y ffmpeg
+
+# Arch / Manjaro
+sudo pacman -S --needed ffmpeg
+
+# macOS（Homebrew）
+brew install ffmpeg
+
+# Windows（任选其一，安装后确认 ffmpeg.exe / ffprobe.exe 在 PATH 上）
+winget install Gyan.FFmpeg
+# 或 choco install ffmpeg
+# 或 scoop install ffmpeg
+
+# 校验
+ffmpeg -version | head -n 1
+ffprobe -version | head -n 1
+```
+
+若 `ffmpeg` 不在 PATH 上而无法修改系统环境，可在启动前临时追加目录：
+
+```bash
+export PATH="/opt/ffmpeg/bin:$PATH"
+```
+
+
+### 0.3 下载 ONNX Runtime（仅 YOLO 后端需要）
+
+```bash
+cd <repo>/rodent-act
+mkdir -p models
+
+# 按 CPU 架构选择包名：onnxruntime-linux-x64-1.22.0 / onnxruntime-linux-aarch64-1.22.0 /
+# onnxruntime-osx-arm64-1.22.0 / onnxruntime-win-x64-1.22.0 ...
+curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
+  | tar xz --wildcards '*/lib/libonnxruntime.so*'
+cp onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0 models/libonnxruntime.so
+
+# 每次运行前（或写入 ~/.bashrc / 服务单元 Environment=）
+export ORT_DYLIB_PATH="$PWD/models/libonnxruntime.so"
+```
+
+| 平台 | 包名后缀 | 库文件名 |
+|---|---|---|
+| Linux x86_64 | `onnxruntime-linux-x64` | `libonnxruntime.so.1.22.0` |
+| Linux aarch64 | `onnxruntime-linux-aarch64` | 同上 |
+| macOS (Apple Silicon) | `onnxruntime-osx-arm64` | `libonnxruntime.1.22.0.dylib` |
+| Windows x64 | `onnxruntime-win-x64` | `onnxruntime.dll` |
+
+> 静态链接 ORT 需要 glibc ≥ 2.38，本项目使用 `load-dynamic`，glibc 2.35 即可。
+
+
+---
+
 ## 1. 快速开始
+
+前置依赖见第 0 节（**至少需要 `ffmpeg`/`ffprobe`**）。
 
 ```bash
 # 1) 编译（前端 dist 会被嵌入二进制；先构建前端可得到单文件版本）
