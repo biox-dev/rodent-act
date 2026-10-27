@@ -10,8 +10,8 @@
 ## 1. 快速开始
 
 ```bash
-# 1) 编译
-cargo build --release
+# 1) 编译（前端 dist 会被嵌入二进制；先构建前端可得到单文件版本）
+(cd frontend && npm install && npm run build) && cargo build --release
 
 # 2) 下载 ONNX Runtime 动态库（仅 YOLO 后端需要）
 curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
@@ -42,8 +42,11 @@ export ORT_DYLIB_PATH=models/libonnxruntime.so
   -o out/yolo_tracked.mp4 --json out/yolo_tracks.json
 
 # 6) 浏览器可视化界面（实时标注帧 + 窗口时间轴，见 2.5 节）
-(cd frontend && npm install && npm run build) && ./target/release/rodent-act serve
+./target/release/rodent-act serve
 ```
+
+> `frontend/dist` 已通过 `build.rs` **嵌入二进制**，`serve` 不再需要旁边的
+> 前端目录，拷走一个可执行文件即可部署。
 
 `out/tracked.mp4` 是可以直接播放/预览的标注视频：每个目标一个固定颜色的
 框、ID、置信度、运动轨迹，左上角 HUD 显示帧号 / 时间 / 目标数。
@@ -89,6 +92,8 @@ ffmpeg (子进程)              (Rust)
 | `src/classify.rs` | XGBoost 接口（骨架已就位，见第 5 节） |
 | `src/pipeline.rs` | 端到端流水线 + 统计 + JSON/CSV 导出 + `FrameHook` 逐帧回调 |
 | `src/web/` | **Axum 服务**：REST + SSE（日志/进度/标注帧）+ 前端静态托管 |
+| `src/web/assets.rs` | 编译期嵌入的前端文件表（由 `build.rs` 生成）+ 路径校验 / MIME |
+| `build.rs` | 遍历 `frontend/dist` 生成 `include_bytes!` 表，缺失时只告警不失败 |
 | `frontend/` | **React + Vite UI**：选片 → 跑分析 → 实时看标注帧 → 回放 + 时间轴 + 曲线 |
 
 ---
@@ -98,17 +103,33 @@ ffmpeg (子进程)              (Rust)
 除了 CLI，还有一个浏览器界面：选视频 → 后台跑分析 → **实时看到标注帧** →
 完成后在任意视频播放器上叠加检测框，并查看 0.5 s 窗口时间轴与特征曲线。
 
+前端构建产物在**编译期嵌入二进制**（`build.rs` → `src/web/assets.rs`），
+所以部署只需要一个 `rodent-act` 可执行文件，没有 `frontend/dist` 也能打开 UI。
+
 ```bash
-# ① 编译前端（只需一次，改了前端再跑一次）
+# ① 编译前端（只需一次，改了前端再跑一次，然后再重新 cargo build）
 cd frontend && npm install && npm run build && cd ..
 
 # ② 编译并启动（默认 http://127.0.0.1:8080）
-ORT_DYLIB_PATH=models/libonnxruntime.so cargo run --release -- serve
+ORT_DYLIB_PATH=models/libonnxruntime.so cargo build --release
+./target/release/rodent-act serve
 #    ├── --addr 0.0.0.0:8080      绑定的地址
 #    ├── --media-dir media        视频选择器扫描的目录
 #    ├── --out-dir out            job 输出（CSV / 可选 mp4）
-#    └── --frontend frontend/dist 前端构建产物；缺失时只提供 API
+#    └── --frontend frontend/dist 可选：改用磁盘上的构建（无需重新编译）
 ```
+
+`--frontend` 只在目录内**确有 `index.html`** 时才生效，否则回退到嵌入版本：
+
+| 情况 | 行为 |
+|---|---|
+| 编译时 `frontend/dist` 存在 | 嵌入，单文件即可运行 |
+| 编译时缺失 + 运行时给了 `--frontend` | 从磁盘服务（日志 `serving frontend from disk`） |
+| 两者都没有 | 只提供 `/api`，前端 404 |
+
+嵌入版 `index.html` 发 `cache-control: no-cache`，`/assets/*`（文件名带哈希）
+发 `immutable`；未知路径回退到 `index.html` 以支持 React Router 直接刷新。
+编译日志会打印 `embedded N frontend files (X KiB)`，缺失时有 `cargo:warning`。
 
 ### 前端开发模式（热更新）
 
@@ -366,10 +387,13 @@ ORT_DYLIB_PATH=models/libonnxruntime.so \
 ## 7. 开发
 
 ```bash
-cargo test                 # 24 个单元测试：匈牙利/卡尔曼/追踪/NMS/blob/中值背景/特征/XGBoost
+cargo test                 # 26 个单元测试：匈牙利/卡尔曼/追踪/NMS/blob/中值背景/特征/XGBoost/嵌入静态资源
 cargo run --example debug_detect -- media/x.mp4 40 0.05 [model.onnx]  # 打印该帧所有候选检测
 cargo run --example debug_blob   -- media/x.mp4 40 22                 # 打印 blob 检测结果
 ```
+
+改了前端后必须**重新 `cargo build`** 才会进二进制（`build.rs` 监听
+`frontend/dist` 的变更）；日常调 UI 可用 `--frontend` 或 Vite dev server 热更新。
 
 调试开关：`RUST_LOG=debug`、`--show-rois`、`--preview-every 25`（终端 ASCII 预览）。
 

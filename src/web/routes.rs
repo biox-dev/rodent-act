@@ -938,26 +938,38 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
 
     let mut app = Router::new().nest("/api", api);
 
-    if let Some(dist) = frontend_dist {
-        let index = dist.join("index.html");
-        if index.exists() {
-            tracing::info!(path = %dist.display(), "serving frontend build");
-            let static_files = tower_http::services::ServeDir::new(dist)
-                .append_index_html_on_directories(true)
-                .fallback(axum::routing::any_service(
-                    tower_http::services::ServeFile::new(index),
-                ));
+    // Priority: an explicit on-disk build (`--frontend <dist>`) wins, so UI
+    // tweaks can be shipped without recompiling; otherwise use the frontend
+    // embedded into the binary by `build.rs`.
+    let on_disk = frontend_dist.filter(|dist| dist.join("index.html").is_file());
+    match on_disk {
+        Some(dist) => {
+            tracing::info!(path = %dist.display(), "serving frontend from disk");
             app = app
                 .nest_service(
                     "/assets",
                     tower_http::services::ServeDir::new(dist.join("assets")),
                 )
                 // Client-side routes (React Router) fall back to index.html.
-                .fallback_service(static_files);
-        } else {
+                .fallback_service(
+                    tower_http::services::ServeDir::new(dist)
+                        .append_index_html_on_directories(true)
+                        .fallback(axum::routing::any_service(
+                            tower_http::services::ServeFile::new(dist.join("index.html")),
+                        )),
+                );
+        }
+        None if crate::web::assets::is_embedded() => {
+            tracing::info!(
+                files = crate::web::assets::count(),
+                "serving frontend embedded at compile time"
+            );
+            app = app.fallback(embedded_asset);
+        }
+        None => {
             tracing::warn!(
-                path = %index.display(),
-                "frontend build missing - run `npm --prefix frontend install && npm --prefix frontend run build`"
+                "frontend build missing - run `npm --prefix frontend install && \
+                 npm --prefix frontend run build`, then rebuild; serving API only"
             );
         }
     }
@@ -968,6 +980,37 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
             .allow_methods(tower_http::cors::Any)
             .allow_headers(tower_http::cors::Any),
     )
+}
+
+/// Serve a file from the frontend embedded at compile time.
+///
+/// Unknown paths fall back to `index.html` so client-side routes work on a
+/// hard refresh. Hashed `/assets/*` files are immutable; `index.html` must be
+/// revalidated so an upgraded binary is picked up.
+async fn embedded_asset(uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let (body, served, immutable) = match crate::web::assets::get(path) {
+        Some(bytes) => (bytes, path, path.starts_with("assets/")),
+        None => match crate::web::assets::get("index.html") {
+            Some(bytes) => (bytes, "index.html", false),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
+    };
+
+    let cache = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, crate::web::assets::mime_type(served)),
+            (header::CACHE_CONTROL, cache),
+        ],
+        Body::from(body),
+    )
+        .into_response()
 }
 
 /// Start the HTTP server (blocking until shutdown).

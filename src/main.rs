@@ -217,8 +217,10 @@ enum Command {
         #[arg(long, default_value = "out")]
         out_dir: PathBuf,
 
-        /// Built frontend (Vite `dist`). Skipped when missing - use the dev
-        /// server (`npm run dev`, proxying /api here) instead.
+        /// Optional override for the built frontend (Vite `dist`) served from
+        /// disk. By default the build embedded at compile time is used, so the
+        /// binary is self-contained; pass this to test a UI change without
+        /// recompiling.
         #[arg(long, default_value = "frontend/dist")]
         frontend: PathBuf,
     },
@@ -462,7 +464,24 @@ fn run_server(
         jobs: std::sync::Arc::new(rodent_act::web::JobManager::new(out_dir, media_dir)),
         log_tx,
     };
-    let frontend = frontend.exists().then_some(frontend);
+    // The embedded copy is the default; `--frontend` only overrides it when the
+    // directory actually contains a build.
+    let frontend = frontend
+        .join("index.html")
+        .is_file()
+        .then_some(frontend);
+    if frontend.is_none() {
+        if rodent_act::web::assets::is_embedded() {
+            tracing::info!(
+                files = rodent_act::web::assets::count(),
+                "using frontend embedded in the binary"
+            );
+        } else {
+            tracing::warn!(
+                "no embedded frontend and no `--frontend` build - the UI is unavailable"
+            );
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
