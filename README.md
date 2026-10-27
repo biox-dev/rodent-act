@@ -107,7 +107,7 @@ cp onnxruntime-linux-x64-gpu-1.22.0/lib/libonnxruntime.so.1.22.0 models/libonnxr
 
 # ③ 运行：auto = 有 GPU 就用，没有就用 CPU
 export ORT_DYLIB_PATH="$PWD/models/libonnxruntime.so"
-./target/release/rodent-act analyze -i TST.mp4 --detector yolo --model models/mouse.onnx \
+./target/release/rodent-act analyze -i  media/synthetic_mice.mp4 --detector yolo --model models/mouse.onnx \
   --device auto --windows out/windows.csv
 ```
 

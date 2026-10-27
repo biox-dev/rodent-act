@@ -223,14 +223,15 @@ pub fn run_with_hook(
         }
         let want = d.resolve_class(&cfg.class_name).with_context(|| {
             format!(
-                "class `{}` not found in model (available: {})",
+                "class `{}` not found in model (available: {}). \
+                 Add --class-name any to accept every class.",
                 cfg.class_name,
                 d.class_names.join(", ")
             )
         })?;
         info!(
             backend = "yolo",
-            classes = d.num_classes(),
+            classes = d.declared_classes(),
             class = %cfg.class_name,
             class_id = want,
             device = %d.device(),
@@ -402,7 +403,7 @@ pub fn run_with_hook(
 
         let mut detections: Vec<Detection> = Vec::new();
         let mut full_dets: Vec<Detection> = Vec::new();
-        let keep = |cls: usize| want_class == usize::MAX || cls == want_class;
+        let keep = |cls: usize| accept_class(want_class, cls);
 
         if let Some(bd) = blob.as_mut() {
             // Blob backend: every frame is cheap, so there is no gating.
@@ -442,7 +443,7 @@ pub fn run_with_hook(
                 }
             }
         }
-        let keep = |cls: usize| want_class == usize::MAX || cls == want_class;
+        let keep = |cls: usize| accept_class(want_class, cls);
 
         // --- 3. tracking ---------------------------------------------------
         let tracks = tracker.update(&detections);
@@ -609,6 +610,24 @@ pub fn run_with_hook(
     if detect_calls == 0 {
         warn!("detector never ran — check motion thresholds or use --refresh-every 1");
     }
+    if cfg.detector == DetectorKind::Yolo && info_out.tracks.is_empty() {
+        if n_detections == 0 {
+            warn!(
+                score_thr = cfg.score_thr,
+                class = %cfg.class_name,
+                "yolo produced no detections at all - lower the score threshold \
+                 (this fine-tuned model peaks around 0.2-0.4) or check the class name"
+            );
+        } else {
+            warn!(
+                detections = n_detections,
+                min_hits = cfg.tracker.min_hits,
+                score_thr = cfg.score_thr,
+                "yolo found sparse detections but no track survived min_hits - \
+                 lower the score threshold or min_hits"
+            );
+        }
+    }
     Ok(info_out)
 }
 
@@ -647,9 +666,19 @@ fn detect_in_rois(
                 d.bbox.y2 + r.y1,
             );
         }
-        out.extend(dets.into_iter().filter(|d| d.class_id == class_id));
+        // `usize::MAX` is the "accept every class" sentinel (`--class-name
+        // any`); comparing it directly would drop every detection.
+        out.extend(dets.into_iter().filter(|d| accept_class(class_id, d.class_id)));
     }
     Ok(out)
+}
+
+/// Class filter shared by the full-frame and ROI detection paths.
+///
+/// `wanted == usize::MAX` is the sentinel for "accept every class"
+/// (`--class-name any`, blob backend).
+fn accept_class(wanted: usize, class_id: usize) -> bool {
+    wanted == usize::MAX || wanted == class_id
 }
 
 fn crop_rgba(rgb: &[u8], w: u32, _h: u32, r: &Bbox) -> Vec<u8> {
@@ -1118,4 +1147,25 @@ pub enum Reference {
 /// Even-rounded copy of a size (ffmpeg/encoder friendly).
 fn fit_even(w: u32, h: u32) -> (u32, u32) {
     (((w + 1) / 2) * 2, ((h + 1) / 2) * 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_class_sentinel_accepts_everything() {
+        // `--class-name any` / blob backend.
+        assert!(accept_class(usize::MAX, 0));
+        assert!(accept_class(usize::MAX, 7));
+    }
+
+    #[test]
+    fn accept_class_filters_exact_id() {
+        assert!(accept_class(0, 0));
+        assert!(!accept_class(0, 1));
+        // Regression: the ROI path used to compare against the sentinel and
+        // therefore dropped every detection in `any` mode.
+        assert!(!accept_class(2, 3));
+    }
 }

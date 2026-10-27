@@ -212,6 +212,16 @@ impl YoloDetector {
     pub fn num_classes(&self) -> usize {
         self.rows.saturating_sub(4)
     }
+
+    /// Number of classes the model declares (ONNX `names` metadata), or the
+    /// class count decoded from the output tensor when the metadata is absent.
+    pub fn declared_classes(&self) -> usize {
+        if self.class_names.is_empty() {
+            self.num_classes()
+        } else {
+            self.class_names.len()
+        }
+    }
 }
 
 pub const COCO_NAMES: [&str; 80] = [
@@ -235,26 +245,65 @@ pub const COCO_MOUSE: usize = 64;
 fn read_names_metadata(session: &Session) -> Option<Vec<String>> {
     let meta = session.metadata().ok()?;
     let raw = meta.custom("names")?;
+    parse_names(&raw)
+}
+
+/// Split a Python-literal-ish container body on commas that are *outside*
+/// quotes, so names containing a comma (`'traffic light, red'`) survive.
+fn split_top_level(inner: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, ch) in inner.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == ',' => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            None => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
+}
+
+/// Unquote a Python string literal / bare token.
+fn unquote(tok: &str) -> String {
+    tok.trim()
+        .trim_matches(|c: char| c == '\'' || c == '"' || c.is_whitespace())
+        .to_string()
+}
+
+/// Parse the Ultralytics `names` metadata value into an ordered class list.
+pub fn parse_names(raw: &str) -> Option<Vec<String>> {
+    let body = raw.trim();
     let mut pairs: Vec<(usize, String)> = Vec::new();
 
-    if raw.trim_start().starts_with('{') {
-        let inner = raw.trim().trim_start_matches('{').trim_end_matches('}');
-        for part in inner.split(',') {
-            let Some((k, v)) = part.split_once(':') else { continue };
-            let Ok(idx) = k.trim().trim_matches('\'').parse::<usize>() else {
+    if body.starts_with('{') {
+        let inner = body.trim_start_matches('{').trim_end_matches('}');
+        for part in split_top_level(inner) {
+            let Some((k, v)) = part.split_once(':') else {
                 continue;
             };
-            let name = v.trim().trim_matches(|c| c == '\'' || c == '"' || c == ' ');
+            let Ok(idx) = unquote(k).parse::<usize>() else {
+                continue;
+            };
+            let name = unquote(v);
             if !name.is_empty() {
-                pairs.push((idx, name.to_string()));
+                pairs.push((idx, name));
             }
         }
-    } else if raw.trim_start().starts_with('[') {
-        let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
-        for (i, part) in inner.split(',').enumerate() {
-            let name = part.trim().trim_matches(|c| c == '\'' || c == '"' || c == ' ');
+    } else if body.starts_with('[') || body.starts_with('(') {
+        let inner = body
+            .trim_start_matches(['[', '('])
+            .trim_end_matches([']', ')']);
+        for (i, part) in split_top_level(inner).into_iter().enumerate() {
+            let name = unquote(part);
             if !name.is_empty() {
-                pairs.push((i, name.to_string()));
+                pairs.push((i, name));
             }
         }
     }
@@ -265,24 +314,52 @@ fn read_names_metadata(session: &Session) -> Option<Vec<String>> {
     let n = pairs.iter().map(|(i, _)| *i).max()? + 1;
     let mut names = vec![String::new(); n];
     for (i, name) in pairs {
-        names[i] = name;
+        if i < n {
+            names[i] = name;
+        }
     }
     Some(names)
 }
 
 #[cfg(test)]
 mod metadata_tests {
-    /// The parser is exercised through the real metadata string shape.
+    use super::parse_names;
+
     #[test]
     fn parses_dict_literal() {
-        let raw = "{0: 'mouse', 1: 'animal'}";
-        let inner = raw.trim().trim_start_matches('{').trim_end_matches('}');
-        let mut names = Vec::new();
-        for part in inner.split(',') {
-            let (k, v) = part.split_once(':').unwrap();
-            assert!(k.trim().parse::<usize>().is_ok());
-            names.push(v.trim().trim_matches(|c| c == '\'' || c == '"' || c == ' ').to_string());
-        }
-        assert_eq!(names, vec!["mouse".to_string(), "animal".to_string()]);
+        assert_eq!(
+            parse_names("{0: 'mouse', 1: 'animal'}").unwrap(),
+            vec!["mouse".to_string(), "animal".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_single_class_dict() {
+        assert_eq!(
+            parse_names("{0: 'item'}").unwrap(),
+            vec!["item".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_list_literal() {
+        assert_eq!(
+            parse_names("['mouse', 'animal']").unwrap(),
+            vec!["mouse".to_string(), "animal".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_out_of_order_and_quoted_commas() {
+        assert_eq!(
+            parse_names("{1: 'traffic light, red', 0: 'mouse'}").unwrap(),
+            vec!["mouse".to_string(), "traffic light, red".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(parse_names("{}").is_none());
+        assert!(parse_names("").is_none());
     }
 }

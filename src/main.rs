@@ -187,6 +187,12 @@ enum Command {
         #[arg(long, default_value_t = 640)]
         max_side: u32,
 
+        /// YOLO detection score threshold. Fine-tuned TST models are usually
+        /// under-confident (peaks around 0.2-0.4), so lower this (e.g. 0.05)
+        /// if tracks come out fragmented or empty.
+        #[arg(long, default_value_t = 0.2)]
+        score_thr: f32,
+
         /// Blob backend: gray contrast threshold.
         #[arg(long, default_value_t = 22)]
         blob_threshold: u8,
@@ -377,6 +383,7 @@ fn main() -> anyhow::Result<()> {
             model,
             class_name,
             max_side,
+            score_thr,
             blob_threshold,
             reference,
             min_hits,
@@ -394,6 +401,7 @@ fn main() -> anyhow::Result<()> {
                 detector,
                 model,
                 max_side,
+                score_thr,
                 blob_threshold,
                 reference: reference.map(parse_reference),
                 class_name,
