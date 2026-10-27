@@ -10,3 +10,8 @@ TST.mp4
 frontend/node_modules
 frontend/dist
 frontend/tsconfig.tsbuildinfo
+yarn.lock
+onnxruntime-linux-x64-gpu_cuda12-1.31.1/
+onnxruntime-linux-x64-1.31.1/
+onnxruntime-linux-x64-gpu_cuda12-1.31.1*
+onnxruntime-linux-x64-1.31.1*

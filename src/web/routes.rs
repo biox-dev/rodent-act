@@ -1023,7 +1023,9 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    tracing::info!("listening on http://{addr}");
+    // Report the address the OS actually bound (resolves `:0` to a real port).
+    let local = listener.local_addr().unwrap_or(addr);
+    tracing::info!("listening on http://{local}");
     axum::serve(listener, app).await.context("axum server")?;
     Ok(())
 }

@@ -189,10 +189,10 @@ ffmpeg (子进程)              (Rust)
 # ① 编译前端（只需一次，改了前端再跑一次，然后再重新 cargo build）
 cd frontend && npm install && npm run build && cd ..
 
-# ② 编译并启动（默认 http://127.0.0.1:8080）
+# ② 编译并启动（默认 http://0.0.0.0:8080，监听所有网卡）
 ORT_DYLIB_PATH=models/libonnxruntime.so cargo build --release
 ./target/release/rodent-act serve
-#    ├── --addr 0.0.0.0:8080      绑定的地址
+#    ├── --addr 0.0.0.0:8080      绑定的地址（只在本机访问可用 127.0.0.1:8080）
 #    ├── --media-dir media        视频选择器扫描的目录
 #    ├── --out-dir out            job 输出（CSV / 可选 mp4）
 #    └── --frontend frontend/dist 可选：改用磁盘上的构建（无需重新编译）

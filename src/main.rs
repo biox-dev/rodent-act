@@ -205,8 +205,8 @@ enum Command {
 
     /// Start the web UI (Axum API + React frontend) for interactive analysis.
     Serve {
-        /// Address to bind.
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        /// Address to bind (0.0.0.0 listens on all interfaces).
+        #[arg(long, default_value = "0.0.0.0:8080")]
         addr: String,
 
         /// Directory scanned for input videos (shown in the picker).
