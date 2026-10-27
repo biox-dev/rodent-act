@@ -1,6 +1,7 @@
 //! ONNX Runtime backend (YOLO11, 80 COCO classes by default).
 
 pub mod blob;
+pub mod device;
 pub mod motion;
 pub mod yolo;
 
@@ -13,11 +14,14 @@ use ort::value::TensorRef;
 
 use crate::common::Detection;
 use crate::preprocess::LetterboxCfg;
+use device::{ActiveDevice, Device};
 
 pub struct YoloDetector {
     session: Session,
     input_name: String,
     output_name: String,
+    /// Execution provider the session was created with (`cpu` or `cuda:0`).
+    pub device: ActiveDevice,
     rows: usize,
     /// Class names baked into the model (empty for single-class models).
     pub class_names: Vec<String>,
@@ -42,6 +46,24 @@ impl YoloDetector {
         max_det: usize,
         threads: usize,
     ) -> Result<Self> {
+        Self::load_with_device(model, score_thr, iou_thr, max_det, threads, Device::Cpu, 0)
+    }
+
+    /// Load a model on an explicit device.
+    ///
+    /// `device` is only honoured by builds compiled with `--features cuda`;
+    /// see [`device`] for the resolution rules. An explicit [`Device::Cuda`]
+    /// on a machine that cannot run it is a hard error, never a silent CPU
+    /// fallback.
+    pub fn load_with_device(
+        model: &Path,
+        score_thr: f32,
+        iou_thr: f32,
+        max_det: usize,
+        threads: usize,
+        device: Device,
+        gpu_device_id: i32,
+    ) -> Result<Self> {
         if !model.exists() {
             bail!(
                 "model not found: {}\n  COCO model:  curl -L -o models/yolo11n.onnx \
@@ -57,12 +79,16 @@ impl YoloDetector {
             .build()
             .context("initialising ONNX Runtime environment")?;
 
-        let session = Session::builder(&env)
+        let builder = Session::builder(&env)
             .map_err(|e| anyhow::anyhow!("Session::builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level1)
             .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?
             .with_intra_threads(threads)
-            .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
+            .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?;
+
+        let (mut builder, active_device) = device::apply(builder, device, gpu_device_id)?;
+
+        let session = builder
             .commit_from_file(model)
             .with_context(|| format!("loading ONNX model {}", model.display()))?;
 
@@ -101,6 +127,7 @@ impl YoloDetector {
             session,
             input_name,
             output_name,
+            device: active_device,
             class_names,
             rows: yolo::expected_rows(80),
             score_thr,
@@ -109,6 +136,11 @@ impl YoloDetector {
             flip_vertical: false,
             input_wh,
         })
+    }
+
+    /// Execution provider actually in use (`cpu`, `cuda:0`, ...).
+    pub fn device(&self) -> ActiveDevice {
+        self.device
     }
 
     /// Network input size, with a 640 fallback for dynamic-shape exports.

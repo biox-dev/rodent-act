@@ -99,6 +99,12 @@ struct ServerInfo {
     media_dir: String,
     out_dir: String,
     ffmpeg: bool,
+    /// Whether this binary was compiled with `--features cuda`.
+    gpu_build: bool,
+    /// Whether a CUDA execution provider can actually be registered.
+    gpu_available: bool,
+    /// Human readable device summary (`Describe()` output).
+    device: String,
     features: Vec<String>,
     default_window_s: f64,
 }
@@ -180,6 +186,9 @@ async fn info(State(st): State<AppState>) -> Json<ServerInfo> {
         media_dir: st.jobs.media_dir().display().to_string(),
         out_dir: st.jobs.out_dir().display().to_string(),
         ffmpeg: has_ffmpeg(),
+        gpu_build: crate::detect::device::Device::compiled_with_gpu(),
+        gpu_available: crate::detect::device::device_available(),
+        device: crate::detect::device::describe(),
         features: crate::features::FEATURE_NAMES
             .iter()
             .map(|s| s.to_string())
@@ -466,6 +475,10 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         show_rois: false,
         show_trails: true,
         threads: 2,
+        // The web UI cannot choose a device yet; `auto` picks the GPU whenever
+        // the binary was built with `--features cuda` and one is usable.
+        device: crate::detect::device::Device::Auto,
+        gpu_device_id: 0,
         max_frames: req.max_frames.filter(|n| *n > 0),
         preview_every: None,
         live_scoring: None,

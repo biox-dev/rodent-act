@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::common::{Bbox, Detection};
 use crate::detect::blob::BlobDetector;
+use crate::detect::device::{ActiveDevice, Device};
 use crate::detect::motion::MotionTrigger;
 use crate::detect::{COCO_NAMES, YoloDetector};
 use crate::draw::{self, DrawTrack, FrameOverlay};
@@ -60,6 +61,11 @@ pub struct PipelineConfig {
     pub show_rois: bool,
     pub show_trails: bool,
     pub threads: usize,
+    /// Compute device for the YOLO backend (`cpu` / `cuda` / `auto`).
+    /// Ignored by the blob backend.
+    pub device: Device,
+    /// CUDA device ordinal used when `device` resolves to CUDA.
+    pub gpu_device_id: i32,
     pub max_frames: Option<usize>,
     pub preview_every: Option<usize>,
     /// Score 0.5 s windows *while* tracking and hand them to the hook, so the
@@ -92,6 +98,8 @@ impl Default for PipelineConfig {
             show_rois: false,
             show_trails: true,
             threads: 2,
+            device: Device::Auto,
+            gpu_device_id: 0,
             max_frames: None,
             preview_every: None,
             live_scoring: None,
@@ -136,6 +144,10 @@ pub struct RunInfo {
     pub duration_s: f64,
     pub detect_calls: usize,
     pub detections: usize,
+    /// Execution provider the detector ran on (`cpu`, `cuda:0`).
+    /// Always `cpu` for the blob backend.
+    #[serde(default)]
+    pub device: String,
     pub tracks: Vec<TrackSummary>,
     pub records: Vec<DetectionRecord>,
 }
@@ -197,7 +209,15 @@ pub fn run_with_hook(
 
     // --- detector backend -------------------------------------------------
     let mut yolo = if cfg.detector == DetectorKind::Yolo {
-        let mut d = YoloDetector::load(&cfg.model, cfg.score_thr, cfg.iou_thr, 100, cfg.threads)?;
+        let mut d = YoloDetector::load_with_device(
+            &cfg.model,
+            cfg.score_thr,
+            cfg.iou_thr,
+            100,
+            cfg.threads,
+            cfg.device,
+            cfg.gpu_device_id,
+        )?;
         if d.class_names.is_empty() {
             d.class_names = COCO_NAMES.iter().map(|s| s.to_string()).collect();
         }
@@ -213,6 +233,7 @@ pub fn run_with_hook(
             classes = d.num_classes(),
             class = %cfg.class_name,
             class_id = want,
+            device = %d.device(),
             "detector ready"
         );
         Some((d, want))
@@ -230,6 +251,18 @@ pub fn run_with_hook(
     } else {
         yolo.as_ref().map(|(_, c)| *c).unwrap_or(usize::MAX)
     };
+
+    // Execution provider actually in use; the blob backend never touches ORT.
+    let active_device = yolo
+        .as_ref()
+        .map(|(d, _)| d.device())
+        .unwrap_or(ActiveDevice::Cpu);
+    if active_device == ActiveDevice::Cpu && cfg.device != Device::Cpu {
+        info!(
+            requested = %cfg.device,
+            "detector running on CPU (no usable GPU execution provider)"
+        );
+    }
 
     // The network input size comes from the ONNX graph (Ultralytics exports a
     // static shape = the `imgsz` used at export time), falling back to 640.
@@ -547,6 +580,7 @@ pub fn run_with_hook(
         duration_s: frame_count as f64 / fps,
         detect_calls,
         detections: n_detections,
+        device: active_device.to_string(),
         tracks: {
             let mut v: Vec<_> = summary.into_values().collect();
             v.sort_by_key(|t| t.id);
@@ -568,6 +602,7 @@ pub fn run_with_hook(
         detect_calls,
         detections = n_detections,
         tracks = info_out.tracks.len(),
+        device = %active_device,
         elapsed_s = elapsed,
         "pipeline finished"
     );

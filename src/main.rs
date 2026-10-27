@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-use rodent_act::{classify, draw, pipeline, pipeline::PipelineConfig, track, video_io};
+use rodent_act::{classify, detect, draw, pipeline, pipeline::PipelineConfig, track, video_io};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -129,6 +129,16 @@ enum Command {
         /// ONNX Runtime intra-op threads.
         #[arg(long, default_value_t = 2)]
         threads: usize,
+
+        /// Compute device for `--detector yolo`: `cpu`, `cuda` or `auto`.
+        /// `cuda` requires a build with `--features cuda` and a GPU ONNX
+        /// Runtime library; it errors out instead of silently using the CPU.
+        #[arg(long, default_value = "auto")]
+        device: detect::device::Device,
+
+        /// CUDA device ordinal (only with `--device cuda`).
+        #[arg(long, default_value_t = 0)]
+        gpu_device: i32,
     },
 
     /// Info about a video (resolution, fps, frame count).
@@ -193,6 +203,14 @@ enum Command {
         /// Frames a track survives without a detection.
         #[arg(long, default_value_t = 30)]
         max_age: usize,
+
+        /// Compute device for `--detector yolo`: `cpu`, `cuda` or `auto`.
+        #[arg(long, default_value = "auto")]
+        device: detect::device::Device,
+
+        /// CUDA device ordinal (only with `--device cuda`).
+        #[arg(long, default_value_t = 0)]
+        gpu_device: i32,
 
         /// Only process the first N frames.
         #[arg(long)]
@@ -296,6 +314,8 @@ fn main() -> anyhow::Result<()> {
             max_frames,
             preview_every,
             threads,
+            device,
+            gpu_device,
         } => {
             let cfg = PipelineConfig {
                 input,
@@ -323,17 +343,20 @@ fn main() -> anyhow::Result<()> {
                 show_rois,
                 show_trails: !no_trails,
                 threads,
+                device,
+                gpu_device_id: gpu_device,
                 max_frames,
                 preview_every,
                 live_scoring: None,
             };
             let info = pipeline::run(&cfg)?;
             println!(
-                "frames={} detect_calls={} detections={} tracks={}",
+                "frames={} detect_calls={} detections={} tracks={} device={}",
                 info.frames,
                 info.detect_calls,
                 info.detections,
-                info.tracks.len()
+                info.tracks.len(),
+                info.device
             );
         }
         Command::Probe { input } => {
@@ -358,6 +381,8 @@ fn main() -> anyhow::Result<()> {
             reference,
             min_hits,
             max_age,
+            device,
+            gpu_device,
             max_frames,
             annotate,
         } => {
@@ -381,6 +406,8 @@ fn main() -> anyhow::Result<()> {
                 },
                 write_video: annotate,
                 threads: 2,
+                device,
+                gpu_device_id: gpu_device,
                 max_frames,
                 ..Default::default()
             };

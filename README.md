@@ -16,6 +16,7 @@
 | `ffmpeg` + `ffprobe` | **必需** | 解码/编码/读取元信息，通过**子进程**调用（不链接任何 C 库） |
 | Rust 工具链（edition 2024） | 必需 | 需要 **rustc ≥ 1.85** |
 | ONNX Runtime 动态库 | 仅 `yolo` 后端 / `serve` 默认模型 | `ort` 以 `load-dynamic` 方式加载，需 `ORT_DYLIB_PATH` |
+| GPU（可选） | 仅 `yolo` 后端加速 | 需 `--features cuda` 编译 + GPU 版 ORT 动态库 + CUDA/cuDNN，见 0.4 节 |
 | Node.js ≥ 18 + npm | 仅构建前端 UI | 不构建前端时二进制仍可运行，但 `serve` 没有页面 |
 | Python ≥ 3.9 + `scikit-learn` | 仅重新训练 XGBoost | 推理已由 `src/classify.rs` 原生实现，**运行期不需要 Python** |
 
@@ -78,8 +79,68 @@ export ORT_DYLIB_PATH="$PWD/models/libonnxruntime.so"
 | Linux aarch64 | `onnxruntime-linux-aarch64` | 同上 |
 | macOS (Apple Silicon) | `onnxruntime-osx-arm64` | `libonnxruntime.1.22.0.dylib` |
 | Windows x64 | `onnxruntime-win-x64` | `onnxruntime.dll` |
+| **Linux x86_64 GPU** | `onnxruntime-linux-x64-gpu` | 同上，另需 CUDA 12.8+ / cuDNN 9（见 0.4 节） |
 
 > 静态链接 ORT 需要 glibc ≥ 2.38，本项目使用 `load-dynamic`，glibc 2.35 即可。
+
+
+### 0.4 GPU 加速（可选，仅 `yolo` 后端）
+
+**仅仅把 `models/libonnxruntime.so` 换成 GPU 版是没用的** —— 还需要用
+`--features cuda` 重新编译，让二进制里编进 CUDA 执行提供程序（EP），
+并在建会话时显式注册。三者缺一不可：
+
+| 条件 | 检查方式 |
+|---|---|
+| ① 二进制带 GPU 支持 | `rodent-act track --help` 里有 `--device`，且 `cargo build --features cuda` 编过 |
+| ② ORT 动态库是 GPU 版 | `onnxruntime-linux-x64-gpu-1.22.0`，不是 `-x64-` |
+| ③ 机器有驱动 + CUDA 12.8+ + cuDNN 9 | `nvidia-smi` 能列出 GPU |
+
+```bash
+# ① 用 GPU 支持编译（CPU 机器上也能编译，只是运行时会走 CPU）
+cargo build --release --features cuda
+
+# ② 下载 GPU 版 ONNX Runtime（体积比 CPU 版大得多，约 250 MB+）
+curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-gpu-1.22.0.tgz \
+  | tar xz --wildcards '*/lib/libonnxruntime.so*'
+cp onnxruntime-linux-x64-gpu-1.22.0/lib/libonnxruntime.so.1.22.0 models/libonnxruntime.so
+
+# ③ 运行：auto = 有 GPU 就用，没有就用 CPU
+export ORT_DYLIB_PATH="$PWD/models/libonnxruntime.so"
+./target/release/rodent-act analyze -i TST.mp4 --detector yolo --model models/mouse.onnx \
+  --device auto --windows out/windows.csv
+```
+
+`--device` 取值：
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | GPU 可用就用 GPU，否则静默用 CPU |
+| `cpu` | 强制 CPU |
+| `cuda` | **强制 GPU**，不可用时报错退出（不会静默退回 CPU） |
+
+判定结果写在日志和输出里：`detector ready ... device=cuda:0`，
+`track` 命令最后的 `... device=cuda:0`，以及 JSON 的 `device` 字段。
+`--gpu-device N` 选择第 N 块卡。
+
+> 用了 `--device cuda` 却报
+> `could not enable the CUDA execution provider`：
+> 说明二进制带 CUDA 支持，但**加载到的 ORT 库不是 GPU 版**，或驱动/cuDNN 版本不匹配。
+> 反之，`--device cuda` 报 `this build has no CUDA support` 则是编译时没加 `--features cuda`。
+
+GPU 版 ORT 硬性要求 **CUDA 12.8 或更新 + cuDNN 9.x**（cuDNN 8 与 9 不兼容）。
+如果机器上装过 PyTorch，可以直接复用它的 CUDA/cuDNN 库：
+
+```bash
+export LD_LIBRARY_PATH="$(python -c 'import nvidia,os;print(os.path.dirname(nvidia.__file__))')/cudnn/lib:$LD_LIBRARY_PATH"
+```
+
+**值不值得用 GPU**：`yolo11n` + 640 px 单帧推理在 CPU 上本来就很快，瓶颈常在
+ffmpeg 解码和 CPU↔GPU 拷贝上；小模型、小批量的场景 GPU 收益有限。用
+`blob` 后端时 GPU 完全不起作用。
+
+**Web UI**：`serve` 固定用 `--device auto`，启动时会把
+`gpu_build` / `gpu_available` / `device` 报在 `GET /api/info` 里。
 
 
 ---
@@ -286,6 +347,8 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 ### 3.2 `yolo`（适合杂乱场景 / 微调模型）
 
 * ONNX Runtime（`ort`，`load-dynamic`，需要 `ORT_DYLIB_PATH`）；
+* **可选 CUDA 加速**：`--features cuda` 编译 + GPU 版 ORT 库，
+  `--device auto|cpu|cuda` 选择（见 0.4 节），日志/输出里会写 `device=cuda:0`；
 * 运动门控 + ROI：场景不动时跳过推理，只在 ROI 上跑 CNN（`--refresh-every` 强制定期全图）；
 * **类名从 ONNX metadata 自动读取**：微调后的单类模型无需额外配置，
   `--class-name mouse` 直接可用；
@@ -466,7 +529,8 @@ ORT_DYLIB_PATH=models/libonnxruntime.so \
 ## 7. 开发
 
 ```bash
-cargo test                 # 26 个单元测试：匈牙利/卡尔曼/追踪/NMS/blob/中值背景/特征/XGBoost/嵌入静态资源
+cargo test                 # 单元测试：匈牙利/卡尔曼/追踪/NMS/blob/中值背景/特征/XGBoost/嵌入静态资源/设备解析
+cargo test --features cuda # 同上，额外编译 CUDA 路径（无 GPU 也能跑）
 cargo run --example debug_detect -- media/x.mp4 40 0.05 [model.onnx]  # 打印该帧所有候选检测
 cargo run --example debug_blob   -- media/x.mp4 40 22                 # 打印 blob 检测结果
 ```
@@ -482,3 +546,6 @@ cargo run --example debug_blob   -- media/x.mp4 40 22                 # 打印 b
   因此固定使用 `Level1`（功能差别仅在于布局优化，不影响正确性）。
 * 静态链接版 ORT 需要 glibc ≥ 2.38；本项目使用 `load-dynamic` 以支持 glibc 2.35。
 * `blob` 后端要求相机固定；相机运动会使背景模型失效。
+* GPU 构建（`--features cuda`）的二进制在无 GPU 机器上仍可用（`--device auto` 走 CPU）；
+  但 `--device cuda` 在没有 GPU 版 ORT 库时会直接报错——这是有意设计的，避免
+  “以为在用 GPU，实际跑的是 CPU”。

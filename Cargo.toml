@@ -28,6 +28,16 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[features]
+# GPU support for the YOLO backend. Off by default so a plain `cargo build`
+# stays CPU-only; enable with `cargo build --release --features cuda`.
+#
+# Enabling the feature does not require an NVIDIA GPU to *compile*, but the
+# resulting binary only uses the GPU when a CUDA-capable ONNX Runtime is
+# loaded via `ORT_DYLIB_PATH` (onnxruntime-linux-x64-gpu-*). Without it the
+# detector prints `device=none` and stays on the CPU.
+cuda = ["ort/cuda"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"
