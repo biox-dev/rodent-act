@@ -479,7 +479,10 @@ pub fn run_with_hook(
         }
 
         // --- 4. annotate ----------------------------------------------------
-        if writer.is_some() || cfg.preview_every.is_some() {
+        // A `FrameHook` (web UI) receives these pixels as its live preview, so
+        // annotate whenever somebody is watching - not only when an mp4 is
+        // being encoded. `preview_every` covers the CLI ASCII preview.
+        if writer.is_some() || cfg.preview_every.is_some() || hook.is_some() {
             let draws: Vec<DrawTrack> = tracks
                 .iter()
                 .filter(|t| keep(t.class_id))

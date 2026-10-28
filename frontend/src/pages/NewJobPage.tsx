@@ -53,6 +53,10 @@ export default function NewJobPage() {
   const [clipStart, setClipStart] = useState(0);
   const [clipEnd, setClipEnd] = useState(0);
   const [previewingClip, setPreviewingClip] = useState(false);
+  // While the user is typing we keep the raw text so intermediate values
+  // (e.g. "3" on the way to "360") are never clamped away or rejected.
+  const [startDraft, setStartDraft] = useState<string | null>(null);
+  const [endDraft, setEndDraft] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -92,6 +96,8 @@ export default function NewJobPage() {
     setDuration(0);
     setClipStart(0);
     setClipEnd(0);
+    setStartDraft(null);
+    setEndDraft(null);
   }, [media]);
 
   const seekPreview = (t: number) => {
@@ -113,8 +119,37 @@ export default function NewJobPage() {
     const v = previewRef.current;
     if (!v) return;
     const t = Math.min(Math.max(v.currentTime, 0), duration);
-    if (edge === 'start') setClipStart(Math.min(t, clipEnd - 0.05));
-    else setClipEnd(Math.max(t, clipStart + 0.05));
+    if (edge === 'start') applyRange(Math.max(Math.min(t, clipEnd - 0.05), 0), clipEnd);
+    else applyRange(clipStart, Math.max(t, clipStart + 0.05));
+  };
+
+  const applyRange = (s: number, e: number) => {
+    setStartDraft(null);
+    setEndDraft(null);
+    setClipStart(s);
+    setClipEnd(e);
+  };
+
+  const fmtSec = (v: number) => String(Number(v.toFixed(2)));
+
+  // Commit (and clamp) whatever text is in the box; only then enforce
+  // start < end so partial input stays typable.
+  const commitStart = (raw: string) => {
+    setStartDraft(null);
+    const v = Number(raw);
+    if (raw.trim() === '' || !Number.isFinite(v)) return;
+    const t = Math.min(Math.max(v, 0), Math.max(clipEnd - 0.05, 0));
+    setClipStart(t);
+    seekPreview(t);
+  };
+
+  const commitEnd = (raw: string) => {
+    setEndDraft(null);
+    const v = Number(raw);
+    if (raw.trim() === '' || !Number.isFinite(v)) return;
+    const t = Math.min(Math.max(v, clipStart + 0.05), duration > 0 ? duration : v);
+    setClipEnd(t);
+    seekPreview(t);
   };
 
   const wholeVideo = duration > 0 && clipStart <= 0.01 && clipEnd >= duration - 0.01;
@@ -222,8 +257,7 @@ export default function NewJobPage() {
                       ? e.currentTarget.duration
                       : 0;
                     setDuration(d);
-                    setClipStart(0);
-                    setClipEnd(d);
+                    applyRange(0, d);
                   }}
                   onTimeUpdate={(e) => {
                     if (previewingClip && e.currentTarget.currentTime >= clipEnd - 0.02) {
@@ -242,12 +276,22 @@ export default function NewJobPage() {
                       min={0}
                       max={Math.max(clipEnd - 0.05, 0)}
                       step={0.1}
-                      value={Number(clipStart.toFixed(2))}
+                      value={startDraft ?? fmtSec(clipStart)}
                       onChange={(e) => {
-                        const v = Number(e.target.value);
-                        if (!Number.isFinite(v)) return;
-                        setClipStart(Math.min(Math.max(v, 0), Math.max(clipEnd - 0.05, 0)));
-                        seekPreview(v);
+                        const raw = e.target.value;
+                        setStartDraft(raw);
+                        const v = Number(raw);
+                        if (raw.trim() === '' || !Number.isFinite(v)) return;
+                        // Only propagate in-range values; out-of-range text is
+                        // kept as-is and clamped once editing finishes.
+                        if (v >= 0 && v <= Math.max(clipEnd - 0.05, 0)) {
+                          setClipStart(v);
+                          seekPreview(v);
+                        }
+                      }}
+                      onBlur={(e) => commitStart(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.currentTarget.blur();
                       }}
                     />
                   </label>
@@ -258,12 +302,20 @@ export default function NewJobPage() {
                       min={Math.min(clipStart + 0.05, duration)}
                       max={duration || undefined}
                       step={0.1}
-                      value={Number(clipEnd.toFixed(2))}
+                      value={endDraft ?? fmtSec(clipEnd)}
                       onChange={(e) => {
-                        const v = Number(e.target.value);
-                        if (!Number.isFinite(v)) return;
-                        setClipEnd(Math.min(Math.max(v, clipStart + 0.05), duration || v));
-                        seekPreview(v);
+                        const raw = e.target.value;
+                        setEndDraft(raw);
+                        const v = Number(raw);
+                        if (raw.trim() === '' || !Number.isFinite(v)) return;
+                        if (v >= clipStart + 0.05 && (duration <= 0 || v <= duration)) {
+                          setClipEnd(v);
+                          seekPreview(v);
+                        }
+                      }}
+                      onBlur={(e) => commitEnd(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.currentTarget.blur();
                       }}
                     />
                   </label>
@@ -275,8 +327,7 @@ export default function NewJobPage() {
                   <button
                     className="ghost"
                     onClick={() => {
-                      setClipStart(0);
-                      setClipEnd(duration);
+                      applyRange(0, duration);
                       seekPreview(0);
                     }}
                     disabled={duration <= 0}
@@ -308,10 +359,7 @@ export default function NewJobPage() {
               duration={duration}
               start={clipStart}
               end={clipEnd}
-              onChange={(s, e) => {
-                setClipStart(s);
-                setClipEnd(e);
-              }}
+              onChange={(s, e) => applyRange(s, e)}
               onScrub={(t) => {
                 const v = previewRef.current;
                 if (v) v.currentTime = Math.min(Math.max(t, 0), duration || t);
