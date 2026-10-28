@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { ScoredWindow } from '../api';
 import { trackColor } from './TrackingOverlay';
+import TrackFilter from './TrackFilter';
 
 interface Props {
   windows: ScoredWindow[];
@@ -102,47 +103,16 @@ export default function SeriesChart({
 
   if (series.length === 0) return <div className="empty">暂无数据</div>;
 
-  const legend =
-    series.length > 1 ? (
-      <div className="chart-legend">
-        {series.map(([trackId]) => {
-          const off = hiddenTracks?.has(trackId) ?? false;
-          const color = trackColor(trackId);
-          return (
-            <button
-              key={trackId}
-              type="button"
-              className={`legend-chip${off ? ' off' : ''}`}
-              disabled={!onToggleTrack}
-              onClick={() => onToggleTrack?.(trackId)}
-              title={onToggleTrack ? '点击显示/隐藏该轨迹' : undefined}
-            >
-              <span
-                className="dot"
-                style={{ background: off ? 'transparent' : color, borderColor: color }}
-              />
-              ID {trackId}
-            </button>
-          );
-        })}
-        {onHideAllTracks &&
-          series.some(([trackId]) => !(hiddenTracks?.has(trackId) ?? false)) && (
-            <button
-              type="button"
-              className="legend-chip none"
-              onClick={onHideAllTracks}
-              title="隐藏全部轨迹"
-            >
-              取消全部
-            </button>
-          )}
-        {hiddenTracks && hiddenTracks.size > 0 && onShowAllTracks && (
-          <button type="button" className="legend-chip all" onClick={onShowAllTracks}>
-            全部
-          </button>
-        )}
-      </div>
-    ) : null;
+  const legend = (
+    <TrackFilter
+      trackIds={series.map(([trackId]) => trackId)}
+      hiddenTracks={hiddenTracks}
+      onToggleTrack={onToggleTrack}
+      onShowAllTracks={onShowAllTracks}
+      onHideAllTracks={onHideAllTracks}
+      minTracks={1}
+    />
+  );
 
   if (visible.length === 0) {
     return (

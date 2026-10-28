@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { api, type LogRecord, type ScoredWindow } from '../api';
 import SeriesChart from '../components/SeriesChart';
 import Timeline from '../components/Timeline';
+import TrackFilter from '../components/TrackFilter';
 import { fmtClock } from '../components/ClipRange';
 import { TrackingOverlay } from '../components/TrackingOverlay';
 import { isTerminal, useAnalysis, useFrameStream, useJobEvents, useLiveWindows } from '../hooks';
@@ -57,6 +58,17 @@ export default function JobPage() {
   const hideAllTracks = useCallback(
     () => setHiddenTracks(new Set(windows.map((w) => w.track_id))),
     [windows],
+  );
+
+  // The per-track stats table honours the same filter as the charts/timeline.
+  const perTrack = job?.summary?.per_track;
+  const perTrackIds = useMemo(() => (perTrack ?? []).map((t) => t.track_id), [perTrack]);
+  const visiblePerTrack = useMemo(
+    () =>
+      hiddenTracks.size > 0
+        ? (perTrack ?? []).filter((t) => !hiddenTracks.has(t.track_id))
+        : (perTrack ?? []),
+    [perTrack, hiddenTracks],
   );
 
   // Frames whose boxes we draw over the <video>: index = round(t * fps).
@@ -577,6 +589,10 @@ export default function JobPage() {
                 duration={clipDuration}
                 current={Math.max(0, Math.min(clipTime, clipDuration || clipTime))}
                 onSeek={seek}
+                hiddenTracks={hiddenTracks}
+                onToggleTrack={toggleTrack}
+                onShowAllTracks={showAllTracks}
+                onHideAllTracks={hideAllTracks}
               />
               {selectedWindow && (
                 <div className="muted mono" style={{ marginTop: 10 }}>
@@ -603,40 +619,52 @@ export default function JobPage() {
               <h3 style={{ marginTop: 20 }}>
                 每条轨迹的窗口统计
                 <span className="sub">
-                  共 {job.summary.n_tracks} 条，均值{' '}
+                  共 {job.summary.n_tracks} 条
+                  {hiddenTracks.size > 0 && `（显示 ${visiblePerTrack.length} 条）`}，均值{' '}
                   {pct(job.summary.mean_immobile_prob)}，阈值 p(imm)={(
                     job.threshold ?? 0.5
                   ).toFixed(2)}
                 </span>
               </h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Track</th>
-                    <th>窗口数</th>
-                    <th>不动窗口</th>
-                    <th>活动窗口</th>
-                    <th>不动比例</th>
-                    <th style={{ width: '35%' }} />
-                  </tr>
-                </thead>
-                <tbody>
-                  {job.summary.per_track.map((t) => (
-                    <tr key={t.track_id}>
-                      <td className="mono">ID {t.track_id}</td>
-                      <td>{t.n_windows}</td>
-                      <td>{t.immobile_windows ?? '—'}</td>
-                      <td>{t.mobile_windows ?? '—'}</td>
-                      <td>{pct(t.immobile_fraction)}</td>
-                      <td>
-                        <div className="progress">
-                          <div style={{ width: `${Math.round(t.immobile_fraction * 100)}%` }} />
-                        </div>
-                      </td>
+              <TrackFilter
+                trackIds={perTrackIds}
+                hiddenTracks={hiddenTracks}
+                onToggleTrack={toggleTrack}
+                onShowAllTracks={showAllTracks}
+                onHideAllTracks={hideAllTracks}
+              />
+              {visiblePerTrack.length === 0 ? (
+                <div className="empty">已隐藏全部轨迹，点击图例恢复</div>
+              ) : (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Track</th>
+                      <th>窗口数</th>
+                      <th>不动窗口</th>
+                      <th>活动窗口</th>
+                      <th>不动比例</th>
+                      <th style={{ width: '35%' }} />
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {visiblePerTrack.map((t) => (
+                      <tr key={t.track_id}>
+                        <td className="mono">ID {t.track_id}</td>
+                        <td>{t.n_windows}</td>
+                        <td>{t.immobile_windows ?? '—'}</td>
+                        <td>{t.mobile_windows ?? '—'}</td>
+                        <td>{pct(t.immobile_fraction)}</td>
+                        <td>
+                          <div className="progress">
+                            <div style={{ width: `${Math.round(t.immobile_fraction * 100)}%` }} />
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </>
           )}
         </div>
