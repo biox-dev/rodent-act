@@ -201,13 +201,13 @@ cat dataset/data.yaml
 ./analytics/.venv/bin/python - <<PY
 from ultralytics import YOLO
 
-model = YOLO("models/yolo11n.pt")          # COCO 预训练权重作为起点
+model = YOLO("models/best.pt")          # COCO 预训练权重作为起点
 model.train(
-    data="dataset/data.yaml",
+    data="out/datasets/TST2/data.yaml",
     epochs=30,
     imgsz=480,
     batch=8,
-    device="cpu",
+    device=0,
     single_cls=True,
     project="$PWD/runs",      # ← 绝对路径，见上方说明
     name="tst",

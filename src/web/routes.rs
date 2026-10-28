@@ -570,6 +570,7 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         input_name: req.media.clone(),
         input,
         clip,
+        dir: job_dir.clone(),
         status: std::sync::RwLock::new(JobStatus::Queued),
         error: std::sync::RwLock::new(None),
         created_ms: now_ms(),
@@ -592,6 +593,9 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         duration_s: std::sync::RwLock::new(None),
     });
     st.jobs.insert(job.clone());
+    // Persist the header before the worker starts so the job is visible again
+    // (as interrupted) even if the server dies right away.
+    job.save_meta();
 
     // Bridge pipeline logs into the per-job buffer + live SSE stream.
     let mut log_rx = st.log_tx.subscribe();

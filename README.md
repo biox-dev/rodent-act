@@ -296,7 +296,7 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 | `/` | 选择视频与**分析区间**（拖动手柄或输入起止时间，只解码选中的片段）+ 参数（检测后端、空场参考、bob 阈值、min_hits、窗口长度、XGB 模型） |
 | `/jobs` | 任务列表：状态、进度、轨迹数、不动比例、耗时（每 3 s 刷新） |
 | `/jobs/:id` | 运行中：SSE 标注帧流 + 进度条 + 实时日志；完成后：视频 + 检测框叠加（Canvas）、窗口时间轴（点击跳转）、`p(immobile)` 曲线、任意特征曲线、每条轨迹统计、窗口明细表 |
-| `/datasets` | 数据集生成：选视频 → 抽帧（帧数/fps/最长边/区间）+ 可选自动预标注（阈值、通道数、ROI）；列出已有数据集 |
+| `/datasets` | 数据集生成：选视频 → **可视化选择起止时间**（播放器 + 拖动手柄，只解码选中的片段）→ 抽帧（帧数/fps/最长边）+ 可选自动预标注（阈值、通道数、ROI）；列出已有数据集 |
 | `/datasets/:name` | 标注编辑器：帧列表（可只看空标注）、Canvas 画/拖/缩放/右键删除框、自动保存、复制上一帧、预标注、校验、划分 train/val |
 
 ### API
@@ -319,7 +319,7 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 | `GET` | `/jobs/{id}/logs` | 日志快照（`?since=N` 增量拉取） |
 | `GET` | `/jobs/{id}/video` | 可选导出的标注 mp4 |
 | `GET` | `/datasets` | 数据集列表（图片/标注框/空帧数/是否已划分） |
-| `POST` | `/datasets/extract` | 抽帧 + 可选预标注 `{"media":"TST.mp4","dataset":"tst","frames":60,"fps":1,"maxSide":960,"autolabel":{"threshold":45,"channels":6,"roi":[0.1,0.1,0.98,0.95]}}` |
+| `POST` | `/datasets/extract` | 抽帧 + 可选预标注；`startS`/`endS` 为源视频秒数（省略 = 整段，只解码这一段）`{"media":"TST.mp4","dataset":"tst","startS":12.5,"endS":60,"frames":60,"fps":1,"maxSide":960,"autolabel":{"threshold":45,"channels":6,"roi":[0.1,0.1,0.98,0.95]}}` |
 | `GET` | `/datasets/{name}/frames` | 帧列表（文件名、框数、宽高） |
 | `GET` | `/datasets/{name}/image/{file}` | 数据集图片（JPEG/PNG） |
 | `GET` / `PUT` | `/datasets/{name}/labels/{file}` | 读取 / 覆盖一张图的 YOLO 标注 `{"boxes":[{"classId":0,"xc":…,"yc":…,"w":…,"h":…}]}` |
@@ -475,8 +475,10 @@ COCO 模型不认识俯视/悬尾的白鼠（实测最高分是 `cat/bear/bowl`�
 ```bash
 # ① 抽帧：按 1 fps 抽 60 帧，缩放到最长边 960，并顺手跑预标注
 #    --channels 是悬尾装置通道数；--roi 限制在装置区域内（重要！）
+#    --start/--end 只抽取源视频的这一段（秒）；省略 = 整段
 ./target/release/rodent-act dataset extract \
   --video TST.mp4 --out dataset/raw \
+  --start 12.5 --end 60 \
   --frames 60 --fps 1 --max-side 960 \
   --autolabel --channels 6 --roi 0.10,0.10,0.98,0.95
 
@@ -487,6 +489,7 @@ COCO 模型不认识俯视/悬尾的白鼠（实测最高分是 `cat/bear/bowl`�
 
 # ③ 人工修正：浏览器里直接改（推荐）
 ./target/release/rodent-act serve        # 打开「数据集」页 → 选择数据集
+#    抽帧页可直接在播放器上拖选起止时间，再点「开始生成并打开标注」
 #    左键拖拽画框 · 拖动框移动 · 拖四角缩放 · 右键删除 · ←/→ 切帧 · 自动保存
 #    每张图的 .txt 与 labelImg / CVAT / Label Studio 完全兼容
 

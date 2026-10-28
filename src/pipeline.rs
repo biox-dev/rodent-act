@@ -817,7 +817,7 @@ pub struct ScoredWindow {
     pub values: Vec<f32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AnalyzeReport {
     pub n_tracks: usize,
     pub feature_names: Vec<String>,

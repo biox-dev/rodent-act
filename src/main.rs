@@ -682,6 +682,16 @@ fn main() -> anyhow::Result<()> {
                     report.step,
                     report.skipped
                 );
+                if start.is_some() || end.is_some() {
+                    println!(
+                        "clip: {} .. {}",
+                        start
+                            .map(|s| format!("{s:.2}s"))
+                            .unwrap_or_else(|| "0.00s".into()),
+                        end.map(|e| format!("{e:.2}s"))
+                            .unwrap_or_else(|| "end".into())
+                    );
+                }
                 if autolabel {
                     let mut auto = dataset::AutolabelOptions {
                         channels,
@@ -798,7 +808,13 @@ fn run_server(
     std::fs::create_dir_all(&out_dir).ok();
 
     let state = rodent_act::web::AppState {
-        jobs: std::sync::Arc::new(rodent_act::web::JobManager::new(out_dir, media_dir)),
+        jobs: {
+            let jobs = std::sync::Arc::new(rodent_act::web::JobManager::new(out_dir, media_dir));
+            // Jobs live in memory; reopen the ones persisted by a previous run
+            // so a restart no longer empties the history.
+            jobs.load_existing();
+            jobs
+        },
         log_tx,
     };
     // The embedded copy is the default; `--frontend` only overrides it when the

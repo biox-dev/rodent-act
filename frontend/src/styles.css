@@ -474,6 +474,55 @@ tbody tr:hover {
   display: block;
 }
 
+/* Track filter chips above a SeriesChart. */
+.chart-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.legend-chip:disabled {
+  cursor: default;
+}
+
+.legend-chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  display: inline-block;
+}
+
+.legend-chip.off {
+  opacity: 0.45;
+}
+
+.legend-chip.all {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 .transport {
   display: flex;
   align-items: center;

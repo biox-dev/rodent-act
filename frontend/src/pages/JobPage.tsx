@@ -33,6 +33,18 @@ export default function JobPage() {
   const [currentTime, setCurrentTime] = useState(0);
   const [selectedWindow, setSelectedWindow] = useState<ScoredWindow | null>(null);
   const [speedFeature, setSpeedFeature] = useState('speed_mean');
+  // One track filter for both charts, so hiding a track in the probability
+  // curve also hides it in the feature curve. Empty set = show everything.
+  const [hiddenTracks, setHiddenTracks] = useState<ReadonlySet<number>>(() => new Set());
+  const toggleTrack = useCallback((trackId: number) => {
+    setHiddenTracks((prev) => {
+      const next = new Set(prev);
+      if (next.has(trackId)) next.delete(trackId);
+      else next.add(trackId);
+      return next;
+    });
+  }, []);
+  const showAllTracks = useCallback(() => setHiddenTracks(new Set()), []);
 
   // Frames whose boxes we draw over the <video>: index = round(t * fps).
   // Tracks only start after `min_hits` detections, so the first frames are
@@ -100,6 +112,11 @@ export default function JobPage() {
   return (
     <div className="page">
       <div className="card">
+        
+        <pre style={{ whiteSpace: 'pre', fontFamily: 'monospace', overflow: 'auto' }}>
+          {JSON.stringify(frameRecords, null, 2)}
+        </pre>
+
         <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <div>
             <h2 style={{ marginBottom: 4 }}>
@@ -207,12 +224,13 @@ export default function JobPage() {
                 ? '实时标注流（分析进行中）'
                 : clipStart > 0.01 || clipEnd !== null
                   ? `原始视频 + 检测框叠加 · 分析区间 ${fmtClock(clipStart)}–${fmtClock(
-                      clipEnd ?? job?.summary?.source_duration_s ?? 0,
-                    )}`
+                    clipEnd ?? job?.summary?.source_duration_s ?? 0,
+                  )}`
                   : '原始视频 + 检测框叠加'}
             </span>
           </h3>
           <div className="video-stage">
+
             {running ? (
               frames.src ? (
                 <img src={frames.src} alt="live frame" />
@@ -225,6 +243,7 @@ export default function JobPage() {
               )
             ) : (
               <>
+
                 <video
                   ref={videoRef}
                   src={api.mediaUrl(job?.input_name ?? '')}
@@ -247,6 +266,7 @@ export default function JobPage() {
               </div>
             )}
           </div>
+
           {!running && (
             <div className="transport">
               <span className="mono">
@@ -314,6 +334,9 @@ export default function JobPage() {
               windows={windows}
               duration={clipDuration}
               current={running ? undefined : Math.max(0, clipTime)}
+              hiddenTracks={hiddenTracks}
+              onToggleTrack={toggleTrack}
+              onShowAllTracks={showAllTracks}
             />
           ) : (
             <div className="empty">
@@ -357,6 +380,9 @@ export default function JobPage() {
                 windows={windows}
                 duration={clipDuration}
                 current={running ? undefined : Math.max(0, clipTime)}
+                hiddenTracks={hiddenTracks}
+                onToggleTrack={toggleTrack}
+                onShowAllTracks={showAllTracks}
               />
             </>
           ) : (

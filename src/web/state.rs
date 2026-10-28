@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use image::codecs::jpeg::JpegEncoder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
 use crate::pipeline::{self, AnalyzeReport, PipelineConfig, RunInfo, ScoredWindow};
@@ -170,7 +170,7 @@ fn encode_jpeg(rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Queued,
@@ -193,6 +193,10 @@ pub struct Job {
     pub input_name: String,
     /// Time window of `input` that is being analysed (`None` = whole file).
     pub clip: Option<crate::video_io::Clip>,
+    /// Directory holding this job's artifacts (`out/web/<id>`), where the
+    /// restart-recovery files (`job.json`, `tracking.json`, `report.json`)
+    /// are written.
+    pub dir: PathBuf,
     pub status: RwLock<JobStatus>,
     pub error: RwLock<Option<String>>,
     pub created_ms: u64,
@@ -220,10 +224,93 @@ impl Job {
 
     pub fn set_status(&self, s: JobStatus) {
         *self.status.write().unwrap_or_else(|e| e.into_inner()) = s;
+        self.save_meta();
     }
 
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancel.clone()
+    }
+
+    /// The part of a job that is persisted as `job.json`.
+    pub fn meta(&self) -> JobMeta {
+        let clip = self.clip;
+        JobMeta {
+            id: self.id.clone(),
+            input: self.input.display().to_string(),
+            input_name: self.input_name.clone(),
+            start_s: clip.map(|c| c.start_s).unwrap_or(0.0),
+            end_s: clip.and_then(|c| c.end_s),
+            created_ms: self.created_ms,
+            status: self.status(),
+            error: self.error.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            duration_s: *self.duration_s.read().unwrap_or_else(|e| e.into_inner()),
+            has_video: self.video.read().map(|v| v.is_some()).unwrap_or(false),
+        }
+    }
+
+    /// Best-effort rewrite of `<job dir>/job.json`.
+    ///
+    /// Called from every status transition: losing this file only costs restart
+    /// recovery for this one job, so failures are logged, not propagated.
+    pub fn save_meta(&self) {
+        if let Err(e) = write_json_atomic(&self.dir.join("job.json"), &self.meta()) {
+            tracing::warn!(job = %self.id, error = %e, "cannot persist job metadata");
+        }
+    }
+}
+
+/// Persisted job header (`out/web/<id>/job.json`).
+///
+/// Holds exactly what cannot be recomputed from the artifacts on disk: which
+/// media file was analysed, which clip, when, and how the job ended. The
+/// per-frame records (`tracking.json`) and scored windows (`report.json`) live
+/// in separate files because they are much larger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobMeta {
+    pub id: String,
+    pub input: String,
+    pub input_name: String,
+    #[serde(default)]
+    pub start_s: f64,
+    #[serde(default)]
+    pub end_s: Option<f64>,
+    pub created_ms: u64,
+    pub status: JobStatus,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub duration_s: Option<f64>,
+    #[serde(default)]
+    pub has_video: bool,
+}
+
+/// Write JSON through a temp file, so a crash can never leave a truncated
+/// `job.json` behind (the loader would silently skip that job).
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        let f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut w = std::io::BufWriter::new(f);
+        serde_json::to_writer_pretty(&mut w, value).context("serialising job json")?;
+        std::io::Write::flush(&mut w)?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {}", path.display()))?;
+    Ok(())
+}
+
+/// Read a JSON artifact, treating a missing or corrupt file as `None`.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = std::fs::read(path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "ignoring corrupt job artifact");
+            None
+        }
     }
 }
 
@@ -458,6 +545,109 @@ impl JobManager {
     pub fn job_dir(&self, id: &str) -> PathBuf {
         self.out_dir.join("web").join(id)
     }
+
+    /// Rebuild the in-memory registry from `out_dir/web/*/job.json`.
+    ///
+    /// Called once at startup: jobs are in-memory objects, so without this the
+    /// whole history disappears whenever the process restarts. Jobs that were
+    /// still queued/running at shutdown cannot be resumed and are marked
+    /// `failed`; finished jobs are reopened from `tracking.json` +
+    /// `report.json` so their records, curve and summary are available again.
+    ///
+    /// Directories without a `job.json` (written by older builds) are left
+    /// alone. Returns the number of restored jobs.
+    pub fn load_existing(&self) -> usize {
+        let root = self.out_dir.join("web");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return 0;
+        };
+        let mut found: Vec<(PathBuf, JobMeta)> = Vec::new();
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            match read_json::<JobMeta>(&dir.join("job.json")) {
+                Some(meta) => found.push((dir, meta)),
+                None => continue,
+            }
+        }
+        // Oldest first: `insert` pushes onto the front, so the newest job ends
+        // up first exactly like a freshly created one.
+        found.sort_by_key(|(_, meta)| meta.created_ms);
+        let total = found.len();
+        let mut interrupted = 0;
+        for (dir, meta) in found {
+            let job = Arc::new(Self::restore(&dir, meta));
+            if !job.status().is_terminal() {
+                interrupted += 1;
+                if let Ok(mut g) = job.error.write() {
+                    *g = Some("interrupted by server restart".to_string());
+                }
+                job.set_status(JobStatus::Failed);
+            }
+            self.insert(job);
+        }
+        if total > 0 {
+            tracing::info!(
+                restored = total,
+                interrupted,
+                path = %root.display(),
+                "restored analysis jobs from disk"
+            );
+        }
+        total
+    }
+
+    /// Reopen one job directory. No worker is started: the job is already
+    /// finished (or was interrupted, in which case it is marked failed by the
+    /// caller).
+    fn restore(dir: &Path, meta: JobMeta) -> Job {
+        let run = read_json::<RunInfo>(&dir.join("tracking.json")).map(Arc::new);
+        let report = read_json::<AnalyzeReport>(&dir.join("report.json")).map(Arc::new);
+        let windows = report
+            .as_ref()
+            .map(|r| r.windows.clone())
+            .unwrap_or_default();
+        let frames = run.as_ref().map(|r| r.frames).unwrap_or(0);
+        let done = report.is_some();
+        // Rebuild the clip the same way `create_job` would have.
+        let clip = if meta.start_s > 1e-3 || meta.end_s.is_some() {
+            Some(crate::video_io::Clip::new(meta.start_s, meta.end_s))
+        } else {
+            None
+        };
+        let video_path = dir.join("annotated.mp4");
+        let video = (meta.has_video && video_path.is_file()).then_some(video_path);
+        let (finished_tx, _) = watch::channel(meta.status.is_terminal());
+        Job {
+            id: meta.id,
+            input: PathBuf::from(meta.input),
+            input_name: meta.input_name,
+            clip,
+            dir: dir.to_path_buf(),
+            status: RwLock::new(meta.status),
+            error: RwLock::new(meta.error),
+            created_ms: meta.created_ms,
+            frames_done: RwLock::new(if done { frames } else { 0 }),
+            total_frames: RwLock::new(frames),
+            run: RwLock::new(run),
+            report: RwLock::new(report),
+            windows: RwLock::new(windows),
+            feature_names: RwLock::new(
+                crate::features::FEATURE_NAMES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            video: RwLock::new(video),
+            frames: Arc::new(FrameBus::new(15.0, 72)),
+            logs: Arc::new(RwLock::new(Vec::new())),
+            cancel: Arc::new(AtomicBool::new(false)),
+            finished: finished_tx,
+            duration_s: RwLock::new(meta.duration_s),
+        }
+    }
 }
 
 /// Snapshot of what the pipeline produced, shared with the browser.
@@ -605,6 +795,10 @@ pub fn execute(
 
     let mut run_cfg = cfg.clone();
     run_cfg.live_scoring = Some(analyze_cfg.clone());
+    // Persist the tracking result next to the other artifacts: the in-memory
+    // `RunInfo` is what `/api/jobs/{id}/records` serves, and it has to survive
+    // a restart too.
+    run_cfg.output_json = Some(job.dir.join("tracking.json"));
     let run = pipeline::run_with_hook(&run_cfg, Some(&mut hook)).context("tracking pipeline")?;
     if job.cancel.load(Ordering::Relaxed) {
         job.set_status(JobStatus::Cancelled);
@@ -652,6 +846,11 @@ pub fn execute(
     }
     if let Ok(mut g) = job.video.write() {
         *g = video.clone();
+    }
+    // Authoritative scored windows, so a restarted server can rebuild the
+    // curve/table without re-running the classifier.
+    if let Err(e) = write_json_atomic(&job.dir.join("report.json"), &*report) {
+        tracing::warn!(job = %job.id, error = %e, "cannot persist window report");
     }
     job.set_status(JobStatus::Done);
     let _ = job.finished.send(true);

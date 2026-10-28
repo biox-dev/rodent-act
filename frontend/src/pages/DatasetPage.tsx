@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api, type DatasetSummary, type MediaFile, type ServerInfo } from '../api';
+import ClipRange, { fmtClock } from '../components/ClipRange';
 
 const VIDEO_EXT = /\.(mp4|avi|mov|mkv|webm)$/i;
 
@@ -30,9 +31,15 @@ export default function DatasetPage() {
   const [fps, setFps] = useState(1);
   const [maxSide, setMaxSide] = useState(960);
   const [quality, setQuality] = useState(92);
-  const [startS, setStartS] = useState(0);
-  const [endS, setEndS] = useState('');
   const [overwrite, setOverwrite] = useState(false);
+
+  // Source-time range selected in the preview. Extraction decodes only this
+  // segment (`ffmpeg -ss/-t`), so no intermediate video is produced.
+  const previewRef = useRef<HTMLVideoElement>(null);
+  const [duration, setDuration] = useState(0);
+  const [clipStart, setClipStart] = useState(0);
+  const [clipEnd, setClipEnd] = useState(0);
+  const [previewingClip, setPreviewingClip] = useState(false);
 
   const [autoLabel, setAutoLabel] = useState(true);
   const [threshold, setThreshold] = useState(45);
@@ -80,9 +87,63 @@ export default function DatasetPage() {
     setName(stemOf(v));
   };
 
+  // A new source file invalidates the previous range; the metadata handler
+  // below resets it once the duration is known.
+  useEffect(() => {
+    setPreviewingClip(false);
+    setDuration(0);
+    setClipStart(0);
+    setClipEnd(0);
+  }, [video]);
+
+  const seekPreview = (t: number) => {
+    const v = previewRef.current;
+    if (!v || !Number.isFinite(t)) return;
+    setPreviewingClip(false);
+    v.currentTime = Math.min(Math.max(t, 0), duration || t);
+  };
+
+  const playSelection = () => {
+    const v = previewRef.current;
+    if (!v || duration <= 0) return;
+    v.currentTime = clipStart;
+    setPreviewingClip(true);
+    void v.play().catch(() => setPreviewingClip(false));
+  };
+
+  const selectWholeVideo = () => {
+    setClipStart(0);
+    setClipEnd(duration);
+    seekPreview(0);
+  };
+
+  const setEdgeFromCurrent = (edge: 'start' | 'end') => {
+    const v = previewRef.current;
+    if (!v) return;
+    const t = Math.min(Math.max(v.currentTime, 0), duration);
+    if (edge === 'start') setClipStart(Math.min(t, clipEnd - 0.05));
+    else setClipEnd(Math.max(t, clipStart + 0.05));
+  };
+
+  const wholeVideo = duration > 0 && clipStart <= 0.01 && clipEnd >= duration - 0.01;
+  const clipOk = duration <= 0 || clipEnd - clipStart >= 0.05;
+
+  const estimateFrames = useMemo(() => {
+    const len = Math.max(0, clipEnd - clipStart);
+    if (len <= 0) return 0;
+    // Samples land on clip-relative frames 0, step, 2*step, ... so a half-open
+    // clip of `len` seconds yields about ceil(len * sampling fps) frames.
+    if (fps > 0) return Math.min(frames, Math.max(1, Math.ceil(len * fps)));
+    return frames;
+  }, [clipStart, clipEnd, fps, frames]);
+
   const submit = async () => {
     if (!video) {
       setError('请选择输入视频');
+      return;
+    }
+    if (duration > 0 && clipEnd - clipStart < 0.05) {
+      setError('抽取区间太短（至少 0.05 s）');
       return;
     }
     setBusy(true);
@@ -97,8 +158,10 @@ export default function DatasetPage() {
         maxSide,
         quality,
         overwrite,
-        startS: startS > 0 ? startS : undefined,
-        endS: endS.trim() ? Number(endS) : undefined,
+        // Omit a full-range selection so the server keeps the container's
+        // exact frame count and skips the extra ffmpeg seek options.
+        startS: duration > 0 && clipStart > 0.01 ? clipStart : undefined,
+        endS: duration > 0 && clipEnd < duration - 0.01 ? clipEnd : undefined,
         autolabel: autoLabel
           ? {
               threshold,
@@ -178,7 +241,132 @@ export default function DatasetPage() {
           </div>
         )}
 
-        <h3 style={{ marginTop: 18 }}>2. 抽帧参数</h3>
+        <h3 style={{ marginTop: 18 }}>
+          2. 选择抽取区间
+          <span className="sub">
+            {duration > 0
+              ? wholeVideo
+                ? `整段视频 · ${fmtClock(duration)}`
+                : `${fmtClock(clipStart)} – ${fmtClock(clipEnd)} · ${(
+                    clipEnd - clipStart
+                  ).toFixed(1)} s`
+              : '只解码选中的片段'}
+          </span>
+        </h3>
+        {video ? (
+          <>
+            <div className="clip-layout">
+              <div className="clip-preview">
+                <video
+                  key={video}
+                  ref={previewRef}
+                  src={api.mediaUrl(video)}
+                  muted
+                  playsInline
+                  controls
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const d = Number.isFinite(e.currentTarget.duration)
+                      ? e.currentTarget.duration
+                      : 0;
+                    setDuration(d);
+                    setClipStart(0);
+                    setClipEnd(d);
+                  }}
+                  onTimeUpdate={(e) => {
+                    if (previewingClip && e.currentTarget.currentTime >= clipEnd - 0.02) {
+                      e.currentTarget.pause();
+                      setPreviewingClip(false);
+                    }
+                  }}
+                />
+              </div>
+              <div className="clip-controls">
+                <div className="row">
+                  <label className="field">
+                    起点 (s)
+                    <input
+                      type="number"
+                      min={0}
+                      max={clipEnd > 0.05 ? clipEnd - 0.05 : undefined}
+                      step={0.1}
+                      value={Number(clipStart.toFixed(2))}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        if (!Number.isFinite(v)) return;
+                        setClipStart(Math.min(Math.max(v, 0), Math.max(clipEnd - 0.05, 0)));
+                        seekPreview(v);
+                      }}
+                    />
+                  </label>
+                  <label className="field">
+                    终点 (s)
+                    <input
+                      type="number"
+                      min={duration > 0 ? Math.min(clipStart + 0.05, duration) : undefined}
+                      max={duration || undefined}
+                      step={0.1}
+                      value={Number(clipEnd.toFixed(2))}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        if (!Number.isFinite(v)) return;
+                        setClipEnd(Math.min(Math.max(v, clipStart + 0.05), duration || v));
+                        seekPreview(v);
+                      }}
+                    />
+                  </label>
+                </div>
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button className="ghost" onClick={playSelection} disabled={duration <= 0}>
+                    ▶ 预览选区
+                  </button>
+                  <button className="ghost" onClick={selectWholeVideo} disabled={duration <= 0}>
+                    整段视频
+                  </button>
+                  <button
+                    className="ghost"
+                    onClick={() => setEdgeFromCurrent('start')}
+                    disabled={duration <= 0}
+                  >
+                    当前设为起点
+                  </button>
+                  <button
+                    className="ghost"
+                    onClick={() => setEdgeFromCurrent('end')}
+                    disabled={duration <= 0}
+                  >
+                    当前设为终点
+                  </button>
+                </div>
+                <div className="hint" style={{ marginTop: 10, fontSize: 11 }}>
+                  抽帧只解码 <b>起点–终点</b> 这一段（ffmpeg 输入 seek + 限时），不会生成中间视频；
+                  保存的文件名里仍是<b>原视频的绝对帧号</b>，方便和视频对照。
+                </div>
+              </div>
+            </div>
+            <ClipRange
+              duration={duration}
+              start={clipStart}
+              end={clipEnd}
+              onChange={(s, e) => {
+                setClipStart(s);
+                setClipEnd(e);
+              }}
+              onScrub={(t) => {
+                const v = previewRef.current;
+                if (v) v.currentTime = Math.min(Math.max(t, 0), duration || t);
+              }}
+            />
+            <div className="hint" style={{ marginTop: 8, fontSize: 11 }}>
+              预计抽取 <b>{estimateFrames}</b> 帧（帧数上限 {frames}，采样{' '}
+              {fps > 0 ? `${fps} fps` : '自动（按帧数均匀取）'}）
+            </div>
+          </>
+        ) : (
+          <div className="empty">先在上方选择视频</div>
+        )}
+
+        <h3 style={{ marginTop: 18 }}>3. 抽帧参数</h3>
         <div className="row">
           <label className="field" style={{ minWidth: 220 }}>
             数据集名称
@@ -231,26 +419,6 @@ export default function DatasetPage() {
               onChange={(e) => setQuality(Number(e.target.value) || 92)}
             />
           </label>
-          <label className="field">
-            起点 (s)
-            <input
-              type="number"
-              min={0}
-              step={0.1}
-              value={startS}
-              onChange={(e) => setStartS(Math.max(0, Number(e.target.value) || 0))}
-            />
-          </label>
-          <label className="field">
-            终点 (s，留空到结尾)
-            <input
-              type="number"
-              min={0}
-              step={0.1}
-              value={endS}
-              onChange={(e) => setEndS(e.target.value)}
-            />
-          </label>
           <label className="field checkbox">
             <input
               type="checkbox"
@@ -262,7 +430,7 @@ export default function DatasetPage() {
         </div>
 
         <h3 style={{ marginTop: 18 }}>
-          3. 自动预标注<span className="sub">可选，生成后仍可手动修正</span>
+          4. 自动预标注<span className="sub">可选，生成后仍可手动修正</span>
         </h3>
         <label className="field checkbox" style={{ marginBottom: 10 }}>
           <input
@@ -364,7 +532,7 @@ export default function DatasetPage() {
         )}
 
         <div className="row" style={{ marginTop: 16 }}>
-          <button onClick={submit} disabled={busy || !video}>
+          <button onClick={submit} disabled={busy || !video || !clipOk}>
             {busy ? '抽帧中…（长视频需要解码整段）' : '开始生成并打开标注'}
           </button>
           <span className="hint" style={{ fontSize: 11 }}>
