@@ -329,7 +329,8 @@ export default function JobPage() {
           <h3>
             轨迹特征曲线
             <span className="sub">
-              按窗口绘制任一特征，用于核对分类依据{running && !live.complete ? ' · 实时增长' : ''}
+              按窗口绘制任一特征，用于核对分类依据；悬停显示时刻，拖动/点击定位视频
+              {running && !live.complete ? ' · 实时增长' : ''}
             </span>
           </h3>
           {hasWindows ? (
@@ -355,6 +356,7 @@ export default function JobPage() {
                 hiddenTracks={hiddenTracks}
                 onToggleTrack={toggleTrack}
                 onShowAllTracks={showAllTracks}
+                onSeek={seek}
               />
             </>
           ) : (
@@ -366,7 +368,8 @@ export default function JobPage() {
           <h3 style={{ marginTop: 22 }}>
             不动概率曲线
             <span className="sub">
-              每窗口 p(immobile)，虚线=0.5 判定阈值{running && !live.complete ? ' · 实时增长' : ''}
+              每窗口 p(immobile)，虚线=0.5 判定阈值；悬停显示时刻，拖动/点击定位视频
+              {running && !live.complete ? ' · 实时增长' : ''}
             </span>
           </h3>
           {hasWindows ? (
@@ -378,6 +381,7 @@ export default function JobPage() {
               hiddenTracks={hiddenTracks}
               onToggleTrack={toggleTrack}
               onShowAllTracks={showAllTracks}
+              onSeek={seek}
             />
           ) : (
             <div className="empty">

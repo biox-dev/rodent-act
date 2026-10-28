@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { ScoredWindow } from '../api';
 import { trackColor } from './TrackingOverlay';
 
@@ -25,6 +25,11 @@ interface Props {
   onToggleTrack?: (trackId: number) => void;
   /** Reset the filter; renders a "全部" chip once anything is hidden. */
   onShowAllTracks?: () => void;
+  /**
+   * Click or drag on the plot seeks the video to that clip-relative time.
+   * Omit to keep the chart read-only.
+   */
+  onSeek?: (t: number) => void;
 }
 
 /**
@@ -41,7 +46,13 @@ export default function SeriesChart({
   hiddenTracks,
   onToggleTrack,
   onShowAllTracks,
+  onSeek,
 }: Props) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  // Time under the mouse (or the dragged cursor); null = no vertical line.
+  const [hoverT, setHoverT] = useState<number | null>(null);
+  const [dragging, setDragging] = useState(false);
+
   const series = useMemo(() => {
     const byTrack = new Map<number, { t: number; v: number }[]>();
     for (const w of windows) {
@@ -126,11 +137,64 @@ export default function SeriesChart({
   const y = (v: number) => H - pad.b - (v / maxV) * (H - pad.t - pad.b);
 
   const ticks = mode === 'prob' ? [0, 0.25, 0.5, 0.75, 1] : [0, maxV / 2, maxV];
+  const plotW = W - pad.l - pad.r;
+
+  // The SVG is stretched non-uniformly (preserveAspectRatio="none"), so map
+  // client x through the element box into viewBox units, then into seconds.
+  const timeAt = (clientX: number): number => {
+    const svg = svgRef.current;
+    if (!svg || plotW <= 0) return 0;
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    const vx = ((clientX - rect.left) / rect.width) * W;
+    const frac = (vx - pad.l) / plotW;
+    return Math.min(Math.max(frac, 0), 1) * maxT;
+  };
+
+  const handlePointerDown = (e: ReactPointerEvent<SVGSVGElement>) => {
+    if (!onSeek) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setDragging(true);
+    const t = timeAt(e.clientX);
+    setHoverT(t);
+    onSeek(t);
+  };
+
+  const handlePointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
+    const t = timeAt(e.clientX);
+    setHoverT(t);
+    // While dragging, scrub the video in step with the cursor.
+    if (dragging) onSeek?.(t);
+  };
+
+  const handlePointerUp = (e: ReactPointerEvent<SVGSVGElement>) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setDragging(false);
+  };
 
   return (
     <div className="chart-block">
       {legend}
-      <svg className="chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img">
+      <svg
+        ref={svgRef}
+        className="chart"
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        role="img"
+        style={{
+          cursor: onSeek ? (dragging ? 'grabbing' : 'crosshair') : 'default',
+          touchAction: 'none',
+        }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onPointerLeave={() => {
+          if (!dragging) setHoverT(null);
+        }}
+      >
         {ticks.map((v) => (
           <g key={v}>
             <line
@@ -178,6 +242,28 @@ export default function SeriesChart({
             strokeWidth={1}
             opacity={0.6}
           />
+        )}
+        {hoverT !== null && (
+          <g pointerEvents="none">
+            <line
+              x1={x(hoverT)}
+              x2={x(hoverT)}
+              y1={pad.t}
+              y2={H - pad.b}
+              stroke="var(--accent)"
+              strokeWidth={1}
+              strokeDasharray="4 3"
+            />
+            <text
+              x={Math.min(Math.max(x(hoverT), pad.l + 22), W - pad.r - 22)}
+              y={pad.t + 10}
+              fill="var(--text)"
+              fontSize={10}
+              textAnchor="middle"
+            >
+              {hoverT.toFixed(2)}s
+            </text>
+          </g>
         )}
         <text x={pad.l} y={H - 6} fill="var(--muted)" fontSize={10}>
           0s
