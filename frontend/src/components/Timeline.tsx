@@ -28,7 +28,8 @@ const LANE_H = 24;
 /**
  * Per-track lane of 0.5 s windows: green = immobile, blue = mobile.
  * Hovering shows a vertical cursor, dragging scrubs, clicking seeks the video
- * to that exact time.
+ * to that exact time. Seeking is delegated to `onSeek`; the caller decides
+ * whether the player resumes (this component never starts playback itself).
  */
 export default function Timeline({
   windows,

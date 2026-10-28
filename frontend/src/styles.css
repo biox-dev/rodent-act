@@ -1008,6 +1008,8 @@ button.danger-text {
 }
 
 .frame-list button span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1029,6 +1031,45 @@ button.danger-text {
 
 .frame-list button .cnt.zero {
   color: var(--danger);
+}
+
+.frame-list button .frame-tags {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 3px;
+}
+
+.frame-list button .frame-tags:empty {
+  display: none;
+}
+
+.frame-split-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.split-chip {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: 0.3px;
+  text-transform: lowercase;
+}
+
+.split-chip.train {
+  background: rgba(41, 211, 152, 0.18);
+  color: var(--accent);
+}
+
+.split-chip.val {
+  background: rgba(255, 183, 77, 0.18);
+  color: var(--warn);
 }
 
 .editor-toolbar {

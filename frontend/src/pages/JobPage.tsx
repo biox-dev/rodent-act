@@ -111,14 +111,20 @@ export default function JobPage() {
   }, [analysis.byFrame, frameIndex, fps, inClip]);
 
   const seek = useCallback(
-    (t: number) => {
+    (t: number, autoPlay = true) => {
       const v = videoRef.current;
       if (!v) return;
       v.currentTime = Math.min(Math.max(clipStart + t, 0), v.duration || t);
-      void v.play();
+      if (autoPlay) void v.play();
+      // Pausing keeps the located frame on screen instead of letting playback
+      // drift away from the picked moment.
+      else v.pause();
     },
     [clipStart],
   );
+
+  /** Timeline scrubbing only positions the frame - it never starts playback. */
+  const seekFrame = useCallback((t: number) => seek(t, false), [seek]);
 
   // Boxes are in analysis pixels, which can differ from the video's natural
   // size (max_side downscale); normalising by the analysis size keeps the
@@ -677,7 +683,7 @@ export default function JobPage() {
           <h3 style={{ marginTop: 22 }}>
             窗口时间轴
             <span className="sub">
-              悬停显示时刻，拖动/点击定位视频
+              悬停显示时刻，拖动/点击定位帧（不自动播放）
               {running && hasWindows && ` · 实时累计 ${windows.length} 个窗口`}
             </span>
           </h3>
@@ -687,7 +693,7 @@ export default function JobPage() {
                 windows={windows}
                 duration={clipDuration}
                 current={Math.max(0, Math.min(clipTime, clipDuration || clipTime))}
-                onSeek={seek}
+                onSeek={seekFrame}
                 hiddenTracks={hiddenTracks}
                 onToggleTrack={toggleTrack}
                 onShowAllTracks={showAllTracks}

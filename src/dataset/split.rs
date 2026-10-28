@@ -8,7 +8,7 @@ use rand::SeedableRng as _;
 use rand::seq::SliceRandom as _;
 use serde::Serialize;
 
-use super::{label_path_for, list_images};
+use super::{is_image_path, is_safe_name, label_path_for, list_images};
 
 #[derive(Debug, Clone)]
 pub struct SplitOptions {
@@ -30,6 +30,134 @@ pub struct SplitReport {
     pub val: usize,
     pub out_dir: String,
     pub data_yaml: String,
+}
+
+/// Where a single frame should live after a manual reassignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignTarget {
+    Train,
+    Val,
+    /// Remove the frame from both exported subsets (keep it in `raw/`).
+    None,
+}
+
+impl AssignTarget {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "train" => Ok(Self::Train),
+            "val" | "valid" | "validation" => Ok(Self::Val),
+            "none" | "raw" | "unassigned" | "" => Ok(Self::None),
+            other => bail!("unknown split `{other}` (expected train, val or none)"),
+        }
+    }
+
+    fn folder(self) -> Option<&'static str> {
+        match self {
+            Self::Train => Some("train"),
+            Self::Val => Some("val"),
+            Self::None => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Train => "train",
+            Self::Val => "val",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignReport {
+    /// Resulting subset (`train`, `val` or `none`).
+    pub split: String,
+    /// Frames actually copied into the requested subset.
+    pub files: usize,
+    pub train: usize,
+    pub val: usize,
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Move frames from `raw/` into `images/{train,val}` (and `labels/...`).
+///
+/// A frame is removed from both subsets first, so a manual assignment never
+/// leaves the same image in train *and* val. `AssignTarget::None` only removes
+/// it from both. Requires an existing `data.yaml` (i.e. a dataset that has been
+/// split at least once), which keeps hand-assignments from creating a
+/// half-initialised export layout.
+pub fn assign_frames(root: &Path, files: &[String], target: AssignTarget) -> Result<AssignReport> {
+    let raw = root.join("raw");
+    if !raw.is_dir() {
+        bail!("no raw/ images in {}", root.display());
+    }
+    if !root.join("data.yaml").is_file() {
+        bail!(
+            "split the dataset first (no data.yaml in {})",
+            root.display()
+        );
+    }
+    if files.is_empty() {
+        bail!("no frames given");
+    }
+    for name in files {
+        if !is_safe_name(name) || !is_image_path(Path::new(name)) {
+            bail!("invalid image name `{name}`");
+        }
+        if !raw.join(name).is_file() {
+            bail!("image not found in raw/: {name}");
+        }
+    }
+
+    let mut written = 0usize;
+    for name in files {
+        let src_img = raw.join(name);
+        let src_lbl = label_path_for(&src_img);
+        // Drop previous copies first: "move" semantics, and no train+val dupes.
+        for subset in ["train", "val"] {
+            remove_if_exists(&root.join("images").join(subset).join(name))?;
+            remove_if_exists(
+                &root
+                    .join("labels")
+                    .join(subset)
+                    .join(Path::new(name).with_extension("txt")),
+            )?;
+        }
+        let Some(subset) = target.folder() else {
+            continue;
+        };
+        let img_dir = root.join("images").join(subset);
+        let lbl_dir = root.join("labels").join(subset);
+        fs::create_dir_all(&img_dir)
+            .with_context(|| format!("creating {}", img_dir.display()))?;
+        fs::create_dir_all(&lbl_dir)
+            .with_context(|| format!("creating {}", lbl_dir.display()))?;
+        fs::copy(&src_img, img_dir.join(name))
+            .with_context(|| format!("copying {}", src_img.display()))?;
+        let dst_lbl = lbl_dir.join(Path::new(name).with_extension("txt"));
+        if src_lbl.exists() {
+            fs::copy(&src_lbl, &dst_lbl)
+                .with_context(|| format!("copying {}", src_lbl.display()))?;
+        } else {
+            fs::write(&dst_lbl, b"").with_context(|| format!("creating {}", dst_lbl.display()))?;
+        }
+        written += 1;
+    }
+
+    Ok(AssignReport {
+        split: target.as_str().to_string(),
+        files: written,
+        train: list_images(&root.join("images/train"))?.len(),
+        val: list_images(&root.join("images/val"))?.len(),
+    })
 }
 
 /// Copy `raw/*` into `images|labels/{train,val}` and write `data.yaml`.

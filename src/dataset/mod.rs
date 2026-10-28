@@ -77,6 +77,18 @@ impl LabelBox {
     }
 }
 
+/// Which exported subset folder currently contains a frame.
+///
+/// A frame can be in both when the split was produced externally (or copied
+/// by hand); the annotation editor shows that explicitly so it can be fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitMember {
+    Train,
+    Val,
+    Both,
+}
+
 /// One image + its label file, as shown in the annotation editor.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +100,8 @@ pub struct DatasetFrame {
     pub boxes: usize,
     pub width: u32,
     pub height: u32,
+    /// `"train"`, `"val"`, `"both"`, or `null` when not exported yet.
+    pub split: Option<SplitMember>,
 }
 
 /// Aggregate counters for a dataset directory (`<root>/raw`).
@@ -242,23 +256,39 @@ pub fn write_labels(path: &Path, boxes: &[LabelBox]) -> Result<()> {
 // summaries
 // --------------------------------------------------------------------------- //
 
-/// Frames in `raw/`, with per-frame box counts and pixel dimensions.
-pub fn list_frames(raw: &Path) -> Result<Vec<DatasetFrame>> {
-    let images = list_images(raw)?;
+/// Exported subset folders that contain `name` (checked by file name).
+fn split_member(root: &Path, name: &str) -> Option<SplitMember> {
+    let in_train = root.join("images/train").join(name).is_file();
+    let in_val = root.join("images/val").join(name).is_file();
+    match (in_train, in_val) {
+        (true, true) => Some(SplitMember::Both),
+        (true, false) => Some(SplitMember::Train),
+        (false, true) => Some(SplitMember::Val),
+        (false, false) => None,
+    }
+}
+
+/// Frames in `root/raw`, with per-frame box counts, dimensions and whether
+/// each one is already copied into `images/{train,val}`.
+pub fn list_frames(root: &Path) -> Result<Vec<DatasetFrame>> {
+    let images = list_images(&root.join("raw"))?;
     let mut out = Vec::with_capacity(images.len());
     for img in images {
         let label = label_path_for(&img);
         let boxes = read_labels(&label).map(|b| b.len()).unwrap_or(0);
         let (width, height) = image::image_dimensions(&img).unwrap_or((0, 0));
+        let name = img
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let split = split_member(root, &name);
         out.push(DatasetFrame {
-            name: img
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
             label: label
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default(),
+            split,
+            name,
             boxes,
             width,
             height,

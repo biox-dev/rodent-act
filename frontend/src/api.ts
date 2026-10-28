@@ -264,12 +264,27 @@ export interface DatasetFrame {
   boxes: number;
   width: number;
   height: number;
+  /** Exported subset containing this frame, or `null` before the first split. */
+  split: SplitMember | null;
 }
+
+/** `"both"` means the same image is currently in `images/train` and `images/val`. */
+export type SplitMember = 'train' | 'val' | 'both';
 
 export interface DatasetFramesResponse {
   name: string;
   dir: string;
+  /** True when `data.yaml` exists (train/val folders were generated). */
+  hasSplit: boolean;
   frames: DatasetFrame[];
+}
+
+/** `POST /api/datasets/{name}/assign` */
+export interface AssignSplitReport {
+  split: 'train' | 'val' | 'none';
+  files: number;
+  train: number;
+  val: number;
 }
 
 /** One YOLO box, normalised to 0..1 (mirrors `dataset::LabelBox`). */
@@ -470,6 +485,15 @@ export const api = {
     request<{ split: SplitReport; check: CheckReport }>(
       `/datasets/${encodeURIComponent(name)}/split`,
       { method: 'POST', body: JSON.stringify(opts) },
+    ),
+  /** Move frames into `train`/`val` (or out of both with `none`). */
+  assignDatasetFrames: (
+    name: string,
+    body: { frames: string[]; target: 'train' | 'val' | 'none' },
+  ) =>
+    request<{ assign: AssignSplitReport; dataset: DatasetSummary }>(
+      `/datasets/${encodeURIComponent(name)}/assign`,
+      { method: 'POST', body: JSON.stringify(body) },
     ),
   checkDataset: (name: string) =>
     request<CheckReport>(`/datasets/${encodeURIComponent(name)}/check`, {

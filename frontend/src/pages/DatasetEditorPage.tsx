@@ -46,6 +46,10 @@ export default function DatasetEditorPage() {
   const [check, setCheck] = useState<CheckReport | null>(null);
   const [checkBusy, setCheckBusy] = useState(false);
 
+  // Frames can be moved into train/val one by one; requires an existing split.
+  const [hasSplit, setHasSplit] = useState(false);
+  const [assignBusy, setAssignBusy] = useState(false);
+
   // Refs mirror the state used by the debounced save so callbacks are stable.
   const boxesRef = useRef<LabelBox[]>([]);
   const dirtyRef = useRef(false);
@@ -61,6 +65,7 @@ export default function DatasetEditorPage() {
     framesRef.current = r.frames;
     setFrames(r.frames);
     setDir(r.dir);
+    setHasSplit(r.hasSplit);
     const c: Record<string, number> = {};
     for (const f of r.frames) c[f.label] = f.boxes;
     applyCounts(c);
@@ -77,6 +82,7 @@ export default function DatasetEditorPage() {
         if (cancelled) return;
         framesRef.current = r.frames;
         setFrames(r.frames);
+        setHasSplit(r.hasSplit);
         setDir(r.dir);
         const c: Record<string, number> = {};
         for (const f of r.frames) c[f.label] = f.boxes;
@@ -95,6 +101,9 @@ export default function DatasetEditorPage() {
 
   const frame = frames[index];
   const frameLabel = frame?.label ?? '';
+  const member = frame?.split ?? null;
+  const inTrain = member === 'train' || member === 'both';
+  const inVal = member === 'val' || member === 'both';
 
   // Load the labels of the current frame.
   useEffect(() => {
@@ -200,6 +209,37 @@ export default function DatasetEditorPage() {
     setSelected(null);
   };
 
+  /** Move the current frame into `train`/`val`, or out of both (`none`). */
+  const assignCurrent = async (target: 'train' | 'val' | 'none') => {
+    const f = framesRef.current[indexRef.current];
+    if (!f) return;
+    setAssignBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      // The export copies raw/<image> + raw/<label>, so flush edits first.
+      await saveNow();
+      const res = await api.assignDatasetFrames(name, { frames: [f.name], target });
+      const next = framesRef.current.map((x) =>
+        x.name === f.name ? { ...x, split: target === 'none' ? null : target } : x,
+      );
+      framesRef.current = next;
+      setFrames(next);
+      setHasSplit(res.dataset.hasSplit);
+      setNotice(
+        target === 'none'
+          ? `已将 ${f.name} 移出训练/验证集`
+          : `已将 ${f.name} 移入${
+              target === 'train' ? '训练集' : '验证集'
+            }（train ${res.dataset.train} / val ${res.dataset.val}）`,
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAssignBusy(false);
+    }
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement | null;
@@ -284,6 +324,9 @@ export default function DatasetEditorPage() {
       const res = await api.splitDataset(name, { valFrac, seed, className });
       setSplit(res.split);
       setCheck(res.check);
+      // The split reassigns every frame, so refresh the per-frame train/val
+      // badges (and enable the manual assign buttons).
+      await loadFrames();
       setNotice(`已生成训练集：train=${res.split.train} val=${res.split.val}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -377,8 +420,25 @@ export default function DatasetEditorPage() {
                   key={f.label}
                   className={i === index ? 'active' : ''}
                   onClick={() => void goto(i)}
+                  title={
+                    f.split === 'both'
+                      ? '同时在训练集和验证集'
+                      : f.split === 'train'
+                        ? '训练集'
+                        : f.split === 'val'
+                          ? '验证集'
+                          : '未加入训练/验证集'
+                  }
                 >
                   <span>{f.name}</span>
+                  <span className="frame-tags">
+                    {(f.split === 'train' || f.split === 'both') && (
+                      <em className="split-chip train">T</em>
+                    )}
+                    {(f.split === 'val' || f.split === 'both') && (
+                      <em className="split-chip val">V</em>
+                    )}
+                  </span>
                   <span className={`cnt${n === 0 ? ' zero' : ''}`}>{n}</span>
                 </button>
               );
@@ -397,9 +457,40 @@ export default function DatasetEditorPage() {
             <span className="mono muted">
               {frames.length ? index + 1 : 0} / {frames.length}
             </span>
+            {hasSplit && (
+              <span className="frame-split-state">
+                {inTrain && <em className="split-chip train">train</em>}
+                {inVal && <em className="split-chip val">val</em>}
+                {!inTrain && !inVal && <span className="muted">未分配</span>}
+              </span>
+            )}
             <span className="spacer" />
             <button className="ghost" onClick={() => void copyPrevious()} disabled={index === 0}>
               复制上一帧
+            </button>
+            <button
+              className="ghost"
+              onClick={() => void assignCurrent('train')}
+              disabled={assignBusy || !frame || !hasSplit}
+              title="把当前帧复制到 images/train（同时从 val 移除）"
+            >
+              移入训练集
+            </button>
+            <button
+              className="ghost"
+              onClick={() => void assignCurrent('val')}
+              disabled={assignBusy || !frame || !hasSplit}
+              title="把当前帧复制到 images/val（同时从 train 移除）"
+            >
+              移入验证集
+            </button>
+            <button
+              className="ghost"
+              onClick={() => void assignCurrent('none')}
+              disabled={assignBusy || !frame || (!inTrain && !inVal)}
+              title="从 images/train 和 images/val 中移除（保留 raw/ 原图）"
+            >
+              移出划分
             </button>
             <button className="ghost" onClick={() => applyBoxes([])} disabled={!boxes.length}>
               清空
@@ -408,6 +499,12 @@ export default function DatasetEditorPage() {
               {saving ? '保存中…' : dirty ? '未保存…' : savedAt ? '已保存 ✓' : ''}
             </span>
           </div>
+
+          {!hasSplit && (
+            <div className="hint" style={{ marginTop: 6, fontSize: 11 }}>
+              还没有训练/验证划分：先点右侧「划分训练/验证集」，之后才能把单帧移入 train/val。
+            </div>
+          )}
 
           {frame ? (
             <BoxEditor
@@ -426,7 +523,9 @@ export default function DatasetEditorPage() {
 
           <div className="hint" style={{ marginTop: 8, fontSize: 11 }}>
             左键拖拽画新框 · 拖动框移动 · 拖四角缩放 · 右键删除 ·
-            <b> ←/→</b> 切换帧 · <b>Delete</b> 删除选中 · 修改会自动保存
+            <b> ←/→</b> 切换帧 · <b>Delete</b> 删除选中 · 修改会自动保存。
+            「移入训练集/验证集」会把当前帧复制到 <code>images/train</code> 或{' '}
+            <code>images/val</code>（并移出另一侧）；重新「划分训练/验证集」会重置这些手动分配。
           </div>
           {selected != null && boxes[selected] && (
             <div className="mono muted" style={{ marginTop: 6 }}>
@@ -605,6 +704,9 @@ export default function DatasetEditorPage() {
               <code> raw/</code> 重新拷贝。生成后可直接训练：
               <div className="mono" style={{ marginTop: 4, wordBreak: 'break-all' }}>
                 python analytics/model_tools.py fine-tune --data dataset/data.yaml
+              </div>
+              <div style={{ marginTop: 4 }}>
+                注意：重新划分会按随机种子重新分配，覆盖编辑器里手动「移入训练集/验证集」的结果。
               </div>
             </div>
           </div>

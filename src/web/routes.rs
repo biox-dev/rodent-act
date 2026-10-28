@@ -1309,10 +1309,13 @@ async fn dataset_frames(
     if !raw.is_dir() {
         return api_error(StatusCode::NOT_FOUND, "unknown dataset");
     }
-    match tokio::task::spawn_blocking(move || dataset::list_frames(&raw)).await {
+    let has_split = root.join("data.yaml").is_file();
+    let root_for_list = root.clone();
+    match tokio::task::spawn_blocking(move || dataset::list_frames(&root_for_list)).await {
         Ok(Ok(frames)) => Json(serde_json::json!({
             "name": name,
             "dir": root.display().to_string(),
+            "hasSplit": has_split,
             "frames": frames,
         }))
         .into_response(),
@@ -1642,6 +1645,61 @@ async fn dataset_split(
     }
 }
 
+/// `POST /api/datasets/{name}/assign` - move frames into train/val (or out).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssignSplitRequest {
+    /// Image file names inside `raw/` (`TST_000012.jpg`).
+    frames: Vec<String>,
+    /// `"train"`, `"val"` or `"none"` (remove from both subsets).
+    target: String,
+}
+
+async fn dataset_assign(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    Json(req): Json<AssignSplitRequest>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    if !root.join("raw").is_dir() {
+        return api_error(StatusCode::NOT_FOUND, "unknown dataset");
+    }
+    if req.frames.len() > 500 {
+        return api_error(StatusCode::BAD_REQUEST, "too many frames (max 500)");
+    }
+    let target = match dataset::split::AssignTarget::parse(&req.target) {
+        Ok(t) => t,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let summary_root = root.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        dataset::split::assign_frames(&root, &req.frames, target)
+    })
+    .await;
+    match worker {
+        Ok(Ok(report)) => {
+            tracing::info!(
+                dataset = %name,
+                target = %report.split,
+                files = report.files,
+                "dataset frames reassigned"
+            );
+            Json(serde_json::json!({
+                "assign": report,
+                "dataset": dataset::summarize(&summary_root, &name),
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("assign worker failed: {e}"),
+        ),
+    }
+}
+
 async fn dataset_check(
     State(st): State<AppState>,
     UrlPath(name): UrlPath<String>,
@@ -1705,6 +1763,7 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
         )
         .route("/datasets/{name}/autolabel", post(dataset_autolabel))
         .route("/datasets/{name}/split", post(dataset_split))
+        .route("/datasets/{name}/assign", post(dataset_assign))
         .route("/datasets/{name}/check", post(dataset_check))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
