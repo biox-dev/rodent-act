@@ -28,6 +28,10 @@ export interface ModelFile {
 export interface TrackView {
   track_id: number;
   n_windows: number;
+  /** Windows labelled immobile (`immobile_prob > threshold`). */
+  immobile_windows: number;
+  /** Windows labelled mobile. */
+  mobile_windows: number;
   immobile_fraction: number;
 }
 
@@ -73,6 +77,8 @@ export interface JobView {
   window_s: number;
   /** Window stride currently used for scoring (seconds). */
   stride_s: number;
+  /** Decision threshold on `immobile_prob` (default 0.5). */
+  threshold: number;
   /** XGBoost model in use (`null` = speed-threshold baseline). */
   clf: string | null;
   summary: SummaryView | null;
@@ -129,10 +135,14 @@ export interface ScoredWindow {
 
 export interface WindowsResponse {
   feature_names: string[];
+  /** Decision threshold that produced the labels (`null` while running). */
+  threshold: number | null;
   /** `null` while the job is still running (live windows have no report yet). */
   mean_immobile_prob: number | null;
   /** `null` while the job is still running. */
   per_track_immobile_fraction: [number, number][] | null;
+  /** Window counts per track (`null` while the job is still running). */
+  per_track_stats: TrackWindowStats[] | null;
   windows: ScoredWindow[];
   /** False until the final report exists (or the job reached a terminal state). */
   complete: boolean;
@@ -161,15 +171,28 @@ export interface RescoreRequest {
   window?: number;
   /** Window stride in seconds (omit = keep the job's current value). */
   stride?: number;
+  /** Decision threshold on `immobile_prob` (omit = keep the current value). */
+  threshold?: number;
   /** XGBoost model path; `''` falls back to the speed baseline. */
   clf?: string;
+}
+
+/** `pipeline::TrackWindowStats` - window counts for one track. */
+export interface TrackWindowStats {
+  track_id: number;
+  n_windows: number;
+  immobile_windows: number;
+  mobile_windows: number;
+  immobile_fraction: number;
 }
 
 export interface RescoreResponse {
   feature_names: string[];
   n_windows: number;
+  threshold: number;
   mean_immobile_prob: number;
   per_track_immobile_fraction: [number, number][];
+  per_track_stats: TrackWindowStats[];
   windows: ScoredWindow[];
   job: JobView;
 }
@@ -193,6 +216,8 @@ export interface CreateJobRequest {
   model?: string;
   window?: number;
   stride?: number;
+  /** Decision threshold on `immobile_prob` (default 0.5). */
+  threshold?: number;
   clf?: string;
   writeVideo?: boolean;
 }

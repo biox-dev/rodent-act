@@ -37,6 +37,7 @@ export default function JobPage() {
   // shows what produced the numbers on screen.
   const [rWindow, setRWindow] = useState('');
   const [rStride, setRStride] = useState('');
+  const [rThreshold, setRThreshold] = useState('');
   const [rClf, setRClf] = useState('');
   const [rescoring, setRescoring] = useState(false);
   const [rescoreError, setRescoreError] = useState<string | null>(null);
@@ -110,6 +111,7 @@ export default function JobPage() {
     const w = job.window_s > 0 ? job.window_s : 0.5;
     setRWindow(String(w));
     setRStride(String(job.stride_s > 0 ? job.stride_s : w * 0.5));
+    setRThreshold(String(job.threshold > 0 ? job.threshold : 0.5));
     setRClf(job.clf ?? '');
   }, [job]);
 
@@ -140,9 +142,11 @@ export default function JobPage() {
     try {
       const w = Number(rWindow);
       const s = Number(rStride);
+      const th = Number(rThreshold);
       await api.rescore(id, {
         window: Number.isFinite(w) && w > 0 ? w : undefined,
         stride: Number.isFinite(s) && s > 0 ? s : undefined,
+        threshold: Number.isFinite(th) && th > 0 ? th : undefined,
         clf: rClf.trim(),
       });
       await Promise.all([refresh(), live.reload()]);
@@ -288,6 +292,18 @@ export default function JobPage() {
               />
               <span className="hint">等于窗口长度 = 不重叠（如窗口 0.5 / 步长 0.5）</span>
             </label>
+            <label className="field">
+              判定阈值 p(immobile)
+              <input
+                type="number"
+                step={0.05}
+                min={0.05}
+                max={0.95}
+                value={rThreshold}
+                onChange={(e) => setRThreshold(e.target.value)}
+              />
+              <span className="hint">高于该值判为不动，默认 0.5</span>
+            </label>
             <label className="field" style={{ minWidth: 240 }}>
               XGBoost 模型（留空 = 速度基线）
               <input
@@ -311,7 +327,8 @@ export default function JobPage() {
           </div>
           {rescoreError && <div className="error-box">{rescoreError}</div>}
           <div className="hint" style={{ marginTop: 8, fontSize: 11 }}>
-            当前：窗口 {job.window_s}s / 步长 {job.stride_s}s
+            当前：窗口 {job.window_s ?? '—'}s / 步长 {job.stride_s ?? '—'}s / 阈值 p(imm)
+            ={(job.threshold ?? 0.5).toFixed(2)}
             {job.clf ? ` · 模型 ${job.clf}` : ' · 速度阈值基线'}。重算只更新窗口特征、
             不动概率、时间轴与统计，视频与检测框不变；结果会覆盖本任务的 windows.csv /
             report.json。
@@ -516,13 +533,15 @@ export default function JobPage() {
           <h3 style={{ marginTop: 22 }}>
             不动概率曲线
             <span className="sub">
-              每窗口 p(immobile)，虚线=0.5 判定阈值；悬停显示时刻，拖动/点击定位视频
+              每窗口 p(immobile)，虚线={(job?.threshold ?? 0.5).toFixed(2)} 判定阈值；
+              悬停显示时刻，拖动/点击定位视频
               {running && !live.complete ? ' · 实时增长' : ''}
             </span>
           </h3>
           {hasWindows ? (
             <SeriesChart
               mode="prob"
+              threshold={job?.threshold ?? 0.5}
               windows={windows}
               duration={clipDuration}
               current={running ? undefined : Math.max(0, clipTime)}
@@ -582,9 +601,12 @@ export default function JobPage() {
           {job?.summary && job.summary.per_track.length > 0 && (
             <>
               <h3 style={{ marginTop: 20 }}>
-                每条轨迹的不动比例
+                每条轨迹的窗口统计
                 <span className="sub">
-                  共 {job.summary.n_tracks} 条，均值 {pct(job.summary.mean_immobile_prob)}
+                  共 {job.summary.n_tracks} 条，均值{' '}
+                  {pct(job.summary.mean_immobile_prob)}，阈值 p(imm)={(
+                    job.threshold ?? 0.5
+                  ).toFixed(2)}
                 </span>
               </h3>
               <table>
@@ -592,8 +614,10 @@ export default function JobPage() {
                   <tr>
                     <th>Track</th>
                     <th>窗口数</th>
+                    <th>不动窗口</th>
+                    <th>活动窗口</th>
                     <th>不动比例</th>
-                    <th style={{ width: '45%' }} />
+                    <th style={{ width: '35%' }} />
                   </tr>
                 </thead>
                 <tbody>
@@ -601,6 +625,8 @@ export default function JobPage() {
                     <tr key={t.track_id}>
                       <td className="mono">ID {t.track_id}</td>
                       <td>{t.n_windows}</td>
+                      <td>{t.immobile_windows ?? '—'}</td>
+                      <td>{t.mobile_windows ?? '—'}</td>
                       <td>{pct(t.immobile_fraction)}</td>
                       <td>
                         <div className="progress">

@@ -32,6 +32,11 @@ interface Props {
    * Omit to keep the chart read-only.
    */
   onSeek?: (t: number) => void;
+  /**
+   * Decision threshold drawn as a dashed line in `prob` mode. Defaults to 0.5;
+   * the job page passes the threshold that actually produced the labels.
+   */
+  threshold?: number;
 }
 
 /**
@@ -50,6 +55,7 @@ export default function SeriesChart({
   onShowAllTracks,
   onHideAllTracks,
   onSeek,
+  threshold = 0.5,
 }: Props) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Time under the mouse (or the dragged cursor); null = no vertical line.
@@ -225,16 +231,27 @@ export default function SeriesChart({
           </g>
         ))}
         {mode === 'prob' && (
-          <line
-            x1={pad.l}
-            x2={W - pad.r}
-            y1={y(0.5)}
-            y2={y(0.5)}
-            stroke="var(--warn)"
-            strokeWidth={1}
-            strokeDasharray="6 4"
-            opacity={0.8}
-          />
+          <g>
+            <line
+              x1={pad.l}
+              x2={W - pad.r}
+              y1={y(threshold)}
+              y2={y(threshold)}
+              stroke="var(--warn)"
+              strokeWidth={1}
+              strokeDasharray="6 4"
+              opacity={0.8}
+            />
+            <text
+              x={W - pad.r - 4}
+              y={y(threshold) - 4}
+              textAnchor="end"
+              fill="var(--warn)"
+              fontSize={10}
+            >
+              {threshold.toFixed(2)}
+            </text>
+          </g>
         )}
         {visible.map(([trackId, pts]) => (
           <polyline

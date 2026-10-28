@@ -255,6 +255,7 @@ impl Job {
             has_video: self.video.read().map(|v| v.is_some()).unwrap_or(false),
             window_s: analyze.window_s,
             stride_s: Some(analyze.stride_s),
+            threshold: analyze.threshold,
             clf: analyze
                 .classifier
                 .as_ref()
@@ -302,6 +303,9 @@ pub struct JobMeta {
     /// Window stride used for the stored report (seconds).
     #[serde(default)]
     pub stride_s: Option<f64>,
+    /// Decision threshold on `immobile_prob` used for the stored report.
+    #[serde(default = "default_threshold")]
+    pub threshold: f32,
     /// XGBoost model used for the stored report.
     #[serde(default)]
     pub clf: Option<String>,
@@ -310,6 +314,11 @@ pub struct JobMeta {
 /// Default window length for jobs whose `job.json` predates the field.
 fn default_window_s() -> f64 {
     crate::features::DEFAULT_WINDOW_S
+}
+
+/// Default decision threshold for jobs whose `job.json` predates the field.
+fn default_threshold() -> f32 {
+    pipeline::DEFAULT_THRESHOLD
 }
 
 /// Write JSON through a temp file, so a crash can never leave a truncated
@@ -364,6 +373,8 @@ pub struct JobView {
     pub window_s: f64,
     /// Window stride currently used for scoring (seconds).
     pub stride_s: f64,
+    /// Decision threshold on `immobile_prob` (`immobile_prob > threshold`).
+    pub threshold: f32,
     /// XGBoost model in use (`null` = speed-threshold baseline).
     pub clf: Option<String>,
     pub summary: Option<SummaryView>,
@@ -395,6 +406,8 @@ pub struct SummaryView {
 pub struct TrackView {
     pub track_id: usize,
     pub n_windows: usize,
+    pub immobile_windows: usize,
+    pub mobile_windows: usize,
     pub immobile_fraction: f32,
 }
 
@@ -403,15 +416,37 @@ impl SummaryView {
         let mut s = Self::from_windows(run, &report.windows);
         s.n_tracks = report.n_tracks;
         s.mean_immobile_prob = report.mean_immobile_prob;
-        s.per_track = report
-            .per_track_immobile_fraction
-            .iter()
-            .map(|(id, frac)| TrackView {
-                track_id: *id,
-                n_windows: report.windows.iter().filter(|w| w.track_id == *id).count(),
-                immobile_fraction: *frac,
-            })
-            .collect();
+        s.per_track = if report.per_track_stats.is_empty() {
+            // Reports written before `per_track_stats` existed only carry the
+            // fraction; reconstruct the counts from the window list.
+            report
+                .per_track_immobile_fraction
+                .iter()
+                .map(|(id, frac)| {
+                    let n = report.windows.iter().filter(|w| w.track_id == *id).count();
+                    let imm = (frac * n as f32).round() as usize;
+                    TrackView {
+                        track_id: *id,
+                        n_windows: n,
+                        immobile_windows: imm.min(n),
+                        mobile_windows: n.saturating_sub(imm),
+                        immobile_fraction: *frac,
+                    }
+                })
+                .collect()
+        } else {
+            report
+                .per_track_stats
+                .iter()
+                .map(|st| TrackView {
+                    track_id: st.track_id,
+                    n_windows: st.n_windows,
+                    immobile_windows: st.immobile_windows,
+                    mobile_windows: st.mobile_windows,
+                    immobile_fraction: st.immobile_fraction,
+                })
+                .collect()
+        };
         s
     }
 
@@ -462,6 +497,8 @@ impl SummaryView {
                 .map(|(id, (imm, total))| TrackView {
                     track_id: id,
                     n_windows: total,
+                    immobile_windows: imm,
+                    mobile_windows: total - imm,
                     immobile_fraction: if total > 0 {
                         imm as f32 / total as f32
                     } else {
@@ -528,6 +565,7 @@ impl Job {
             has_video: self.video.read().map(|v| v.is_some()).unwrap_or(false),
             window_s: analyze.window_s,
             stride_s: analyze.stride_s,
+            threshold: analyze.threshold,
             clf: analyze
                 .classifier
                 .as_ref()
@@ -687,6 +725,7 @@ impl JobManager {
                 classifier: meta.clf.map(PathBuf::from),
                 window_s,
                 stride_s: meta.stride_s.unwrap_or(window_s * 0.5).max(0.05),
+                threshold: meta.threshold.clamp(0.01, 0.99),
             }),
             windows: RwLock::new(windows),
             feature_names: RwLock::new(

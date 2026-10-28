@@ -790,6 +790,15 @@ pub struct AnalyzeConfig {
     pub classifier: Option<PathBuf>,
     pub window_s: f64,
     pub stride_s: f64,
+    /// `immobile_prob` above this value => the window is labelled immobile.
+    pub threshold: f32,
+}
+
+/// Decision threshold used when the caller does not set one.
+pub const DEFAULT_THRESHOLD: f32 = 0.5;
+
+fn default_threshold() -> f32 {
+    DEFAULT_THRESHOLD
 }
 
 impl Default for AnalyzeConfig {
@@ -798,6 +807,7 @@ impl Default for AnalyzeConfig {
             classifier: None,
             window_s: crate::features::DEFAULT_WINDOW_S,
             stride_s: crate::features::DEFAULT_WINDOW_S * 0.5,
+            threshold: DEFAULT_THRESHOLD,
         }
     }
 }
@@ -822,9 +832,28 @@ pub struct AnalyzeReport {
     pub n_tracks: usize,
     pub feature_names: Vec<String>,
     pub mean_immobile_prob: f32,
+    /// Decision threshold applied to `immobile_prob` for this report.
+    #[serde(default = "default_threshold")]
+    pub threshold: f32,
     /// Fraction of windows labelled immobile, per track.
     pub per_track_immobile_fraction: Vec<(usize, f32)>,
+    /// Window counts per track (immobile / mobile / total).
+    #[serde(default)]
+    pub per_track_stats: Vec<TrackWindowStats>,
     pub windows: Vec<ScoredWindow>,
+}
+
+/// Per-track window counts produced with a given decision threshold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackWindowStats {
+    pub track_id: usize,
+    pub n_windows: usize,
+    /// Windows labelled immobile (`immobile_prob > threshold`).
+    pub immobile_windows: usize,
+    /// Windows labelled mobile (the rest).
+    pub mobile_windows: usize,
+    /// `immobile_windows / n_windows`.
+    pub immobile_fraction: f32,
 }
 
 /// Run tracking, then score every window of every track.
@@ -860,6 +889,7 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
 
     let mut windows: Vec<ScoredWindow> = Vec::new();
     let mut per_track: Vec<(usize, f32)> = Vec::new();
+    let mut per_track_stats: Vec<TrackWindowStats> = Vec::new();
 
     for (tid, recs) in by_track.iter() {
         if recs.len() < 4 {
@@ -907,7 +937,7 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
                 w.values[idx] = (ref_size / frame_diag).clamp(0.0, 1.0);
             }
 
-            let pred = clf.predict(&w.values)?;
+            let pred = clf.predict(&w.values)?.with_threshold(cfg.threshold);
             let rii = crate::features::rii_score(&samples, crate::features::RII_PIXEL_THRESHOLD);
 
             if pred.label == crate::classify::ActClass::Immobile {
@@ -929,11 +959,19 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
         }
         if total > 0 {
             per_track.push((*tid, immobile as f32 / total as f32));
+            per_track_stats.push(TrackWindowStats {
+                track_id: *tid,
+                n_windows: total,
+                immobile_windows: immobile,
+                mobile_windows: total - immobile,
+                immobile_fraction: immobile as f32 / total as f32,
+            });
         }
     }
 
     windows.sort_by(|a, b| (a.track_id, a.start_frame).cmp(&(b.track_id, b.start_frame)));
     per_track.sort_by_key(|(id, _)| *id);
+    per_track_stats.sort_by_key(|s| s.track_id);
 
     let mean_immobile_prob = if windows.is_empty() {
         0.0
@@ -945,7 +983,9 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
         n_tracks: by_track.len(),
         feature_names: names,
         mean_immobile_prob,
+        threshold: cfg.threshold,
         per_track_immobile_fraction: per_track,
+        per_track_stats,
         windows,
     })
 }
@@ -963,6 +1003,8 @@ pub struct LiveScorer {
     /// Window length / stride in frames.
     n: usize,
     stride: usize,
+    /// Decision threshold applied to `immobile_prob`.
+    threshold: f32,
     frame_diag: f32,
     /// Per-frame boxes of every track seen so far.
     tracks: HashMap<usize, Vec<(usize, Bbox, f32)>>,
@@ -983,6 +1025,7 @@ impl LiveScorer {
             fps,
             n,
             stride,
+            threshold: cfg.threshold,
             frame_diag: ((frame_w * frame_w + frame_h * frame_h) as f32).sqrt(),
             tracks: HashMap::new(),
             next: HashMap::new(),
@@ -1081,7 +1124,7 @@ impl LiveScorer {
         if let Some(idx) = w.names.iter().position(|s| s == "size_norm") {
             w.values[idx] = (ref_size / self.frame_diag).clamp(0.0, 1.0);
         }
-        let pred = self.clf.predict(&w.values).ok()?;
+        let pred = self.clf.predict(&w.values).ok()?.with_threshold(self.threshold);
         let rii = crate::features::rii_score(&samples, crate::features::RII_PIXEL_THRESHOLD);
         Some(ScoredWindow {
             track_id: tid,
@@ -1195,5 +1238,82 @@ mod tests {
         // Regression: the ROI path used to compare against the sentinel and
         // therefore dropped every detection in `any` mode.
         assert!(!accept_class(2, 3));
+    }
+
+    /// One slowly drifting track: the baseline classifier gives a mid-range
+    /// probability, so the decision threshold decides the label - and the
+    /// per-track counts must follow it.
+    fn slow_drift_run() -> RunInfo {
+        let mut records = Vec::new();
+        for f in 0..100usize {
+            let x = 100.0 + f as f32 * 0.05;
+            records.push(DetectionRecord {
+                frame: f,
+                track_id: 1,
+                x1: x,
+                y1: 50.0,
+                x2: x + 20.0,
+                y2: 70.0,
+                score: 1.0,
+                measured: true,
+                motion_energy: 0.0,
+            });
+        }
+        RunInfo {
+            input: "synthetic".into(),
+            width: 640,
+            height: 360,
+            fps: 25.0,
+            frames: 100,
+            duration_s: 4.0,
+            start_s: 0.0,
+            end_s: None,
+            source_duration_s: 4.0,
+            detect_calls: 100,
+            detections: 100,
+            device: "cpu".into(),
+            tracks: Vec::new(),
+            records,
+        }
+    }
+
+    #[test]
+    fn threshold_relabels_windows_and_counts() {
+        use crate::classify::ActClass;
+        let info = slow_drift_run();
+
+        let low = score_tracks(
+            &info,
+            &AnalyzeConfig {
+                threshold: 0.01,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let high = score_tracks(
+            &info,
+            &AnalyzeConfig {
+                threshold: 0.99,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!low.windows.is_empty() && low.windows.len() == high.windows.len());
+        // The probability is unchanged: only the label cut moves.
+        assert_eq!(low.mean_immobile_prob, high.mean_immobile_prob);
+        assert!(low.windows.iter().all(|w| w.label == ActClass::Immobile));
+        assert!(high.windows.iter().all(|w| w.label == ActClass::Mobile));
+
+        let lo = &low.per_track_stats[0];
+        assert_eq!(lo.n_windows, low.windows.len());
+        assert_eq!(lo.immobile_windows, lo.n_windows);
+        assert_eq!(lo.mobile_windows, 0);
+
+        let hi = &high.per_track_stats[0];
+        assert_eq!(hi.immobile_windows, 0);
+        assert_eq!(hi.mobile_windows, hi.n_windows);
+        assert_eq!(high.threshold, 0.99);
+        assert_eq!(low.threshold, 0.01);
     }
 }

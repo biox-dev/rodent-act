@@ -40,6 +40,7 @@ export default function NewJobPage() {
   const [scoreThr, setScoreThr] = useState(0.2);
   const [window, setWindowS] = useState(0.5);
   const [stride, setStride] = useState('');
+  const [threshold, setThreshold] = useState(0.5);
   const [clf, setClf] = useState('');
   const [writeVideo, setWriteVideo] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -144,6 +145,7 @@ export default function NewJobPage() {
       model: detector === 'yolo' ? model || undefined : undefined,
       window,
       stride: stride ? Number(stride) : undefined,
+      threshold,
       clf: clf || undefined,
       writeVideo,
     };
@@ -520,6 +522,21 @@ export default function NewJobPage() {
             <span className="hint">
               相邻窗口起点的时间间隔。留空 = 窗口的一半（50% 重叠）；
               填成与窗口相同（如 0.5 / 0.5）即<b>不重叠</b>，窗口数减半、结果更“整段化”。
+            </span>
+          </label>
+          <label className="field">
+            判定阈值 p(immobile)
+            <input
+              type="number"
+              step={0.05}
+              min={0.05}
+              max={0.95}
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+            />
+            <span className="hint">
+              窗口的“不动”概率高于该值即判为不动，默认 0.5。调高更严格（少判不动），
+              调低更宽松。任务完成后也能在任务页改此值重算，无需重新分析视频。
             </span>
           </label>
           <label className="field" style={{ minWidth: 240 }}>

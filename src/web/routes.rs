@@ -75,6 +75,9 @@ pub struct CreateJob {
     pub window: Option<f64>,
     #[serde(default)]
     pub stride: Option<f64>,
+    /// Decision threshold on `immobile_prob` (default 0.5).
+    #[serde(default)]
+    pub threshold: Option<f32>,
     #[serde(default)]
     pub clf: Option<String>,
     /// Write an H.264 preview next to the frames (extra ffmpeg pass).
@@ -560,6 +563,10 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         classifier: req.clf.filter(|s| !s.is_empty()).map(PathBuf::from),
         window_s: window,
         stride_s: req.stride.unwrap_or(window * 0.5).max(0.05),
+        threshold: req
+            .threshold
+            .unwrap_or(crate::pipeline::DEFAULT_THRESHOLD)
+            .clamp(0.01, 0.99),
     };
 
     let (finished_tx, _) = tokio::sync::watch::channel(false);
@@ -666,6 +673,9 @@ pub struct RescoreJob {
     /// Window stride in seconds (omitted = keep the job's current value).
     #[serde(default)]
     pub stride: Option<f64>,
+    /// Decision threshold on `immobile_prob` (omitted = keep the current one).
+    #[serde(default)]
+    pub threshold: Option<f32>,
     /// XGBoost model path; `""` falls back to the speed baseline, `null` or
     /// omitted keeps the model used by the previous run.
     #[serde(default)]
@@ -706,6 +716,7 @@ async fn rescore_job(
         classifier,
         window_s: window,
         stride_s: stride,
+        threshold: req.threshold.unwrap_or(current.threshold).clamp(0.01, 0.99),
     };
 
     let worker = job.clone();
@@ -718,8 +729,10 @@ async fn rescore_job(
             Json(serde_json::json!({
                 "feature_names": &r.feature_names,
                 "n_windows": r.windows.len(),
+                "threshold": r.threshold,
                 "mean_immobile_prob": r.mean_immobile_prob,
                 "per_track_immobile_fraction": &r.per_track_immobile_fraction,
+                "per_track_stats": &r.per_track_stats,
                 "windows": &r.windows,
                 "job": job.view(),
             }))
@@ -783,8 +796,10 @@ async fn job_windows(State(st): State<AppState>, UrlPath(id): UrlPath<String>) -
     let complete = report.is_some() || status.is_terminal();
     Json(serde_json::json!({
         "feature_names": names,
+        "threshold": report.as_ref().map(|r| r.threshold),
         "mean_immobile_prob": report.as_ref().map(|r| r.mean_immobile_prob),
         "per_track_immobile_fraction": report.as_ref().map(|r| &r.per_track_immobile_fraction),
+        "per_track_stats": report.as_ref().map(|r| &r.per_track_stats),
         "windows": windows,
         "complete": complete,
         "status": status,

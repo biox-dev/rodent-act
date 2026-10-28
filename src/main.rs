@@ -182,6 +182,11 @@ enum Command {
         #[arg(long)]
         stride: Option<f64>,
 
+        /// Decision threshold on `immobile_prob` (default 0.5): windows above it
+        /// are labelled immobile.
+        #[arg(long, default_value_t = 0.5)]
+        threshold: f32,
+
         /// Detection backend.
         #[arg(long, value_enum, default_value_t = pipeline::DetectorKind::Blob)]
         detector: pipeline::DetectorKind,
@@ -271,6 +276,10 @@ enum Command {
         /// Window stride in seconds (defaults to half the window => 50 % overlap).
         #[arg(long)]
         stride: Option<f64>,
+
+        /// Decision threshold on `immobile_prob` (default 0.5).
+        #[arg(long, default_value_t = 0.5)]
+        threshold: f32,
     },
 
     /// Start the web UI (Axum API + React frontend) for interactive analysis.
@@ -437,6 +446,38 @@ enum DatasetCommand {
     },
 }
 
+/// Print a one-line summary plus per-track window counts for an analysis report.
+///
+/// `immobile` / `mobile` counts follow the report's decision threshold, so
+/// `--threshold` is visible in the output instead of being silently applied.
+fn print_analysis(report: &pipeline::AnalyzeReport) {
+    let immobile = report
+        .windows
+        .iter()
+        .filter(|w| w.label == classify::ActClass::Immobile)
+        .count();
+    println!(
+        "tracks={} windows={} immobile_windows={} mobile_windows={} threshold={:.2} \
+         mean_immobile_prob={:.3}",
+        report.n_tracks,
+        report.windows.len(),
+        immobile,
+        report.windows.len() - immobile,
+        report.threshold,
+        report.mean_immobile_prob
+    );
+    for s in &report.per_track_stats {
+        println!(
+            "  track {}: immobile {}/{} ({:.1}%), mobile {}",
+            s.track_id,
+            s.immobile_windows,
+            s.n_windows,
+            s.immobile_fraction * 100.0,
+            s.mobile_windows
+        );
+    }
+}
+
 /// Build a clip from `--start`/`--end`, rejecting inverted or empty windows.
 fn parse_clip(start: Option<f64>, end: Option<f64>) -> anyhow::Result<Option<video_io::Clip>> {
     let start = start.unwrap_or(0.0);
@@ -583,6 +624,7 @@ fn main() -> anyhow::Result<()> {
             clf,
             window,
             stride,
+            threshold,
             detector,
             model,
             class_name,
@@ -630,23 +672,11 @@ fn main() -> anyhow::Result<()> {
                 classifier: clf,
                 window_s: window,
                 stride_s: stride.unwrap_or(window * 0.5),
+                threshold,
             };
             let report = pipeline::analyze(&track, &analyze_cfg)?;
             pipeline::write_window_csv(&windows, &report.feature_names, &report.windows)?;
-            println!(
-                "tracks={} windows={} immobile_windows={} mean_immobile_prob={:.3}",
-                report.n_tracks,
-                report.windows.len(),
-                report
-                    .windows
-                    .iter()
-                    .filter(|w| w.label == classify::ActClass::Immobile)
-                    .count(),
-                report.mean_immobile_prob
-            );
-            for (id, frac) in &report.per_track_immobile_fraction {
-                println!("  track {id}: immobile {:.1}%", frac * 100.0);
-            }
+            print_analysis(&report);
         }
         Command::Rescore {
             json,
@@ -654,6 +684,7 @@ fn main() -> anyhow::Result<()> {
             clf,
             window,
             stride,
+            threshold,
         } => {
             let file = std::fs::File::open(&json)
                 .map_err(|e| anyhow::anyhow!("opening {}: {e}", json.display()))?;
@@ -663,23 +694,11 @@ fn main() -> anyhow::Result<()> {
                 classifier: clf,
                 window_s: window,
                 stride_s: stride.unwrap_or(window * 0.5),
+                threshold,
             };
             let report = pipeline::score_tracks(&info, &analyze_cfg)?;
             pipeline::write_window_csv(&windows, &report.feature_names, &report.windows)?;
-            println!(
-                "tracks={} windows={} immobile_windows={} mean_immobile_prob={:.3}",
-                report.n_tracks,
-                report.windows.len(),
-                report
-                    .windows
-                    .iter()
-                    .filter(|w| w.label == classify::ActClass::Immobile)
-                    .count(),
-                report.mean_immobile_prob
-            );
-            for (id, frac) in &report.per_track_immobile_fraction {
-                println!("  track {id}: immobile {:.1}%", frac * 100.0);
-            }
+            print_analysis(&report);
         }
         Command::Serve { .. } => unreachable!("handled before the CLI subscriber"),
         Command::Snapshot {

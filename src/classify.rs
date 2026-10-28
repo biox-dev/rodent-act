@@ -34,6 +34,22 @@ pub struct Prediction {
     pub label: ActClass,
 }
 
+impl Prediction {
+    /// Re-label the prediction with a caller-supplied decision threshold.
+    ///
+    /// The model always produces a probability; the 0.5 cutoff is just the
+    /// default. Keeping the threshold out of the model lets the UI explore
+    /// stricter / looser criteria (`--threshold`) without re-scoring.
+    pub fn with_threshold(mut self, threshold: f32) -> Self {
+        self.label = if self.immobile_prob > threshold {
+            ActClass::Immobile
+        } else {
+            ActClass::Mobile
+        };
+        self
+    }
+}
+
 pub trait Classifier: Send {
     fn predict(&self, values: &[f32]) -> Result<Prediction>;
 }
