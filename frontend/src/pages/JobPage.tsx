@@ -112,10 +112,8 @@ export default function JobPage() {
   return (
     <div className="page">
       <div className="card">
-        
-        <pre style={{ whiteSpace: 'pre', fontFamily: 'monospace', overflow: 'auto' }}>
-          {JSON.stringify(frameRecords, null, 2)}
-        </pre>
+
+
 
         <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <div>
@@ -215,79 +213,159 @@ export default function JobPage() {
         </div>
       )}
 
-      <div>
-        <div className="card">
-          <h3>
-            视频
-            <span className="sub">
-              {running
-                ? '实时标注流（分析进行中）'
-                : clipStart > 0.01 || clipEnd !== null
-                  ? `原始视频 + 检测框叠加 · 分析区间 ${fmtClock(clipStart)}–${fmtClock(
-                    clipEnd ?? job?.summary?.source_duration_s ?? 0,
-                  )}`
-                  : '原始视频 + 检测框叠加'}
-            </span>
-          </h3>
-          <div className="video-stage">
+      <div className="split" style={{ alignItems: 'start' }}>
+        <div className="col">
+          <div className="card">
+            <h3>
+              视频
+              <span className="sub">
+                {running
+                  ? '实时标注流（分析进行中）'
+                  : clipStart > 0.01 || clipEnd !== null
+                    ? `原始视频 + 检测框叠加 · 分析区间 ${fmtClock(clipStart)}–${fmtClock(
+                      clipEnd ?? job?.summary?.source_duration_s ?? 0,
+                    )}`
+                    : '原始视频 + 检测框叠加'}
+              </span>
+            </h3>
+            <div className="video-stage">
 
-            {running ? (
-              frames.src ? (
-                <img src={frames.src} alt="live frame" />
+              {running ? (
+                frames.src ? (
+                  <img src={frames.src} alt="live frame" />
+                ) : (
+                  <div className="empty">
+                    <span className="spinner" />
+                    等待首帧…
+                    {!frames.connected && <div className="muted">帧流未连接</div>}
+                  </div>
+                )
               ) : (
-                <div className="empty">
-                  <span className="spinner" />
-                  等待首帧…
-                  {!frames.connected && <div className="muted">帧流未连接</div>}
-                </div>
-              )
-            ) : (
-              <>
+                <>
 
-                <video
-                  ref={videoRef}
-                  src={api.mediaUrl(job?.input_name ?? '')}
-                  controls
-                  preload="auto"
-                  onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-                  onSeeked={(e) => setCurrentTime(e.currentTarget.currentTime)}
-                />
-                <TrackingOverlay
-                  records={frameRecords}
-                  videoWidth={analysis.records?.width ?? job?.summary?.width ?? 0}
-                  videoHeight={analysis.records?.height ?? job?.summary?.height ?? 0}
-                  visible={running === false && !!analysis.records && inClip}
-                />
-              </>
-            )}
-            {running && frames.src && (
-              <div className="frame-badge">
-                frame {frames.index}/{frames.total || '?'} · t={frames.t.toFixed(2)}s
+                  <video
+                    ref={videoRef}
+                    src={api.mediaUrl(job?.input_name ?? '')}
+                    controls
+                    preload="auto"
+                    onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+                    onSeeked={(e) => setCurrentTime(e.currentTarget.currentTime)}
+                  />
+                  <TrackingOverlay
+                    records={frameRecords}
+                    videoWidth={analysis.records?.width ?? job?.summary?.width ?? 0}
+                    videoHeight={analysis.records?.height ?? job?.summary?.height ?? 0}
+                    visible={running === false && !!analysis.records && inClip}
+                  />
+                </>
+              )}
+              {running && frames.src && (
+                <div className="frame-badge">
+                  frame {frames.index}/{frames.total || '?'} · t={frames.t.toFixed(2)}s
+                </div>
+              )}
+            </div>
+
+            {!running && (
+              <div className="transport">
+                <span className="mono">
+                  {currentTime.toFixed(2)}s · frame {frameIndex}
+                  {!inClip && ' · 不在分析区间'}
+                </span>
+                {frameRecords && frameRecords.length > 0 ? (
+                  <span className="mono">
+                    {frameRecords
+                      .map((r) => `ID${r.track_id} p=${r.motion_energy.toFixed(2)}`)
+                      .join('  ')}
+                  </span>
+                ) : (
+                  <span className="muted">该帧无检测</span>
+                )}
               </div>
             )}
           </div>
 
-          {!running && (
-            <div className="transport">
-              <span className="mono">
-                {currentTime.toFixed(2)}s · frame {frameIndex}
-                {!inClip && ' · 不在分析区间'}
-              </span>
-              {frameRecords && frameRecords.length > 0 ? (
-                <span className="mono">
-                  {frameRecords
-                    .map((r) => `ID${r.track_id} p=${r.motion_energy.toFixed(2)}`)
-                    .join('  ')}
-                </span>
-              ) : (
-                <span className="muted">该帧无检测</span>
-              )}
+          <div className="card">
+            <h3>
+              运行日志
+              <span className="sub">来自 pipeline 的 tracing 事件（SSE 实时推送）</span>
+            </h3>
+            <div className="logs">
+              {logs.length === 0 && <div className="muted">暂无日志</div>}
+              {logs.map((rec, i) => (
+                <div key={`${rec.ts_ms}-${i}`} className={`lvl-${rec.level}`}>
+                  <span className="ts">{fmtTime(rec.ts_ms)}</span>
+                  {rec.message}
+                </div>
+              ))}
             </div>
-          )}
-        </div>
-      </div>
 
-      <div className="split">
+            <h3 style={{ marginTop: 20 }}>
+              窗口明细
+              <span className="sub">
+                {hasWindows
+                  ? `${windows.length} 行${running ? ' · 实时追加' : ''}`
+                  : running
+                    ? '分析进行中…'
+                    : '—'}
+              </span>
+            </h3>
+            <div className="feature-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>track</th>
+                    <th>start</th>
+                    <th>end</th>
+                    <th>p(imm)</th>
+                    <th>RII</th>
+                    <th>label</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {/* Newest first while running, so the growing tail stays visible. */}
+                  {(running ? windows.slice(-200).reverse() : windows.slice(0, 500)).map((w) => (
+                    <tr
+                      key={`${w.track_id}-${w.start_frame}`}
+                      onClick={() => {
+                        setSelectedWindow(w);
+                        seek((w.start_t + w.end_t) / 2);
+                      }}
+                      style={{ cursor: 'pointer' }}
+                    >
+                      <td className="mono">{w.track_id}</td>
+                      <td className="num">{w.start_t.toFixed(2)}</td>
+                      <td className="num">{w.end_t.toFixed(2)}</td>
+                      <td className="num">{w.immobile_prob.toFixed(3)}</td>
+                      <td className="num">{w.rii.toFixed(3)}</td>
+                      <td>
+                        <span
+                          className="badge"
+                          style={{
+                            background:
+                              w.label === 'immobile'
+                                ? 'rgba(41,211,152,.15)'
+                                : 'rgba(74,168,255,.15)',
+                            color: w.label === 'immobile' ? 'var(--immobile)' : 'var(--mobile)',
+                          }}
+                        >
+                          {w.label}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {analysis.error && <div className="error-box" style={{ marginTop: 10 }}>{analysis.error}</div>}
+            
+            <pre style={{ whiteSpace: 'pre', fontFamily: 'monospace', overflow: 'auto' }}>
+              {JSON.stringify(frameRecords, null, 2)}
+            </pre>
+          
+          </div>
+        </div>
+
         <div className="card">
           <h3>
             轨迹特征曲线
@@ -429,80 +507,6 @@ export default function JobPage() {
           )}
         </div>
 
-        <div className="card">
-          <h3>
-            运行日志
-            <span className="sub">来自 pipeline 的 tracing 事件（SSE 实时推送）</span>
-          </h3>
-          <div className="logs">
-            {logs.length === 0 && <div className="muted">暂无日志</div>}
-            {logs.map((rec, i) => (
-              <div key={`${rec.ts_ms}-${i}`} className={`lvl-${rec.level}`}>
-                <span className="ts">{fmtTime(rec.ts_ms)}</span>
-                {rec.message}
-              </div>
-            ))}
-          </div>
-
-          <h3 style={{ marginTop: 20 }}>
-            窗口明细
-            <span className="sub">
-              {hasWindows
-                ? `${windows.length} 行${running ? ' · 实时追加' : ''}`
-                : running
-                  ? '分析进行中…'
-                  : '—'}
-            </span>
-          </h3>
-          <div className="feature-table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>track</th>
-                  <th>start</th>
-                  <th>end</th>
-                  <th>p(imm)</th>
-                  <th>RII</th>
-                  <th>label</th>
-                </tr>
-              </thead>
-              <tbody>
-                {/* Newest first while running, so the growing tail stays visible. */}
-                {(running ? windows.slice(-200).reverse() : windows.slice(0, 500)).map((w) => (
-                  <tr
-                    key={`${w.track_id}-${w.start_frame}`}
-                    onClick={() => {
-                      setSelectedWindow(w);
-                      seek((w.start_t + w.end_t) / 2);
-                    }}
-                    style={{ cursor: 'pointer' }}
-                  >
-                    <td className="mono">{w.track_id}</td>
-                    <td className="num">{w.start_t.toFixed(2)}</td>
-                    <td className="num">{w.end_t.toFixed(2)}</td>
-                    <td className="num">{w.immobile_prob.toFixed(3)}</td>
-                    <td className="num">{w.rii.toFixed(3)}</td>
-                    <td>
-                      <span
-                        className="badge"
-                        style={{
-                          background:
-                            w.label === 'immobile'
-                              ? 'rgba(41,211,152,.15)'
-                              : 'rgba(74,168,255,.15)',
-                          color: w.label === 'immobile' ? 'var(--immobile)' : 'var(--mobile)',
-                        }}
-                      >
-                        {w.label}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {analysis.error && <div className="error-box" style={{ marginTop: 10 }}>{analysis.error}</div>}
-        </div>
       </div>
     </div>
   );
