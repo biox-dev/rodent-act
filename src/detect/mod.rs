@@ -6,6 +6,7 @@ pub mod motion;
 pub mod yolo;
 
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use ort::session::Session;
@@ -15,6 +16,38 @@ use ort::value::TensorRef;
 use crate::common::Detection;
 use crate::preprocess::LetterboxCfg;
 use device::{ActiveDevice, Device};
+
+/// Process-global ONNX Runtime environment.
+///
+/// ONNX Runtime allows exactly **one** environment per process, and `ort`
+/// remembers it for the lifetime of the process (even after the `Environment`
+/// handle is dropped). Creating a second environment therefore fails with
+/// "only one environment is allowed per process", which is what happened when
+/// a second job/dataset was analysed in the same process. Build it once and
+/// keep it alive forever.
+static ONNX_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+
+/// Serialises first-time initialisation so two threads cannot race to create
+/// the environment (the loser would get the "only one environment" error).
+static ONNX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Get the shared ONNX Runtime environment, creating it on first use.
+fn onnx_environment() -> Result<&'static ort::environment::Environment> {
+    if let Some(env) = ONNX_ENV.get() {
+        return Ok(env);
+    }
+
+    let _guard = ONNX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(env) = ONNX_ENV.get() {
+        return Ok(env);
+    }
+
+    let env = ort::init()
+        .with_name("rodent-act")
+        .build()
+        .context("initialising ONNX Runtime environment")?;
+    Ok(ONNX_ENV.get_or_init(|| env))
+}
 
 pub struct YoloDetector {
     session: Session,
@@ -74,12 +107,9 @@ impl YoloDetector {
                 model.display()
             );
         }
-        let env = ort::init()
-            .with_name("rodent-act")
-            .build()
-            .context("initialising ONNX Runtime environment")?;
+        let env = onnx_environment()?;
 
-        let builder = Session::builder(&env)
+        let builder = Session::builder(env)
             .map_err(|e| anyhow::anyhow!("Session::builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level1)
             .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?

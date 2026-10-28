@@ -233,7 +233,7 @@ tail -1 runs/tst/results.csv
 # convert 会把类名写进 ONNX 的 metadata，Rust 端自动读取
 
 ./analytics/.venv/bin/python analytics/model_tools.py convert \
-  runs/tst/weights/best.pt \
+  runs/tst3/weights/best.pt \
   --out models/mouse2.onnx \
   --imgsz 480
 
