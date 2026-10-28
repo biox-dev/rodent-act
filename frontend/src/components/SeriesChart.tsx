@@ -25,6 +25,8 @@ interface Props {
   onToggleTrack?: (trackId: number) => void;
   /** Reset the filter; renders a "全部" chip once anything is hidden. */
   onShowAllTracks?: () => void;
+  /** Hide every track at once; renders a "取消全部" chip. */
+  onHideAllTracks?: () => void;
   /**
    * Click or drag on the plot seeks the video to that clip-relative time.
    * Omit to keep the chart read-only.
@@ -46,6 +48,7 @@ export default function SeriesChart({
   hiddenTracks,
   onToggleTrack,
   onShowAllTracks,
+  onHideAllTracks,
   onSeek,
 }: Props) {
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -116,6 +119,17 @@ export default function SeriesChart({
             </button>
           );
         })}
+        {onHideAllTracks &&
+          series.some(([trackId]) => !(hiddenTracks?.has(trackId) ?? false)) && (
+            <button
+              type="button"
+              className="legend-chip none"
+              onClick={onHideAllTracks}
+              title="隐藏全部轨迹"
+            >
+              取消全部
+            </button>
+          )}
         {hiddenTracks && hiddenTracks.size > 0 && onShowAllTracks && (
           <button type="button" className="legend-chip all" onClick={onShowAllTracks}>
             全部

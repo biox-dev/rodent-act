@@ -580,6 +580,11 @@ tbody tr:hover {
   border-color: var(--accent);
 }
 
+.legend-chip.none {
+  color: var(--muted);
+  border-style: dashed;
+}
+
 .transport {
   display: flex;
   align-items: center;

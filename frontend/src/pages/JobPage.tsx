@@ -45,6 +45,10 @@ export default function JobPage() {
     });
   }, []);
   const showAllTracks = useCallback(() => setHiddenTracks(new Set()), []);
+  const hideAllTracks = useCallback(
+    () => setHiddenTracks(new Set(windows.map((w) => w.track_id))),
+    [windows],
+  );
 
   // Frames whose boxes we draw over the <video>: index = round(t * fps).
   // Tracks only start after `min_hits` detections, so the first frames are
@@ -397,6 +401,7 @@ export default function JobPage() {
                 hiddenTracks={hiddenTracks}
                 onToggleTrack={toggleTrack}
                 onShowAllTracks={showAllTracks}
+                onHideAllTracks={hideAllTracks}
                 onSeek={seek}
               />
             </>
@@ -422,6 +427,7 @@ export default function JobPage() {
               hiddenTracks={hiddenTracks}
               onToggleTrack={toggleTrack}
               onShowAllTracks={showAllTracks}
+              onHideAllTracks={hideAllTracks}
               onSeek={seek}
             />
           ) : (
