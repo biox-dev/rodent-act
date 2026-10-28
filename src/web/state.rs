@@ -409,6 +409,16 @@ pub struct TrackView {
     pub immobile_windows: usize,
     pub mobile_windows: usize,
     pub immobile_fraction: f32,
+    /// Seconds covered by immobile bouts (overlapping windows merged).
+    pub immobile_s: f64,
+    /// Seconds covered by mobile bouts (overlapping windows merged).
+    pub mobile_s: f64,
+    /// Total scored span of this track (`immobile_s + mobile_s`).
+    pub covered_s: f64,
+    /// Longest continuous immobile bout (seconds).
+    pub longest_immobile_s: f64,
+    /// Longest continuous mobile bout (seconds).
+    pub longest_mobile_s: f64,
 }
 
 impl SummaryView {
@@ -416,6 +426,10 @@ impl SummaryView {
         let mut s = Self::from_windows(run, &report.windows);
         s.n_tracks = report.n_tracks;
         s.mean_immobile_prob = report.mean_immobile_prob;
+        // Durations come from the windows themselves so reports written before
+        // the duration fields existed still show correct values.
+        let durs = crate::pipeline::track_durations(&report.windows);
+        let empty = crate::pipeline::LabelDurations::default();
         s.per_track = if report.per_track_stats.is_empty() {
             // Reports written before `per_track_stats` existed only carry the
             // fraction; reconstruct the counts from the window list.
@@ -425,12 +439,18 @@ impl SummaryView {
                 .map(|(id, frac)| {
                     let n = report.windows.iter().filter(|w| w.track_id == *id).count();
                     let imm = (frac * n as f32).round() as usize;
+                    let d = durs.get(id).copied().unwrap_or(empty);
                     TrackView {
                         track_id: *id,
                         n_windows: n,
                         immobile_windows: imm.min(n),
                         mobile_windows: n.saturating_sub(imm),
                         immobile_fraction: *frac,
+                        immobile_s: d.immobile_s,
+                        mobile_s: d.mobile_s,
+                        covered_s: d.covered_s,
+                        longest_immobile_s: d.longest_immobile_s,
+                        longest_mobile_s: d.longest_mobile_s,
                     }
                 })
                 .collect()
@@ -438,12 +458,20 @@ impl SummaryView {
             report
                 .per_track_stats
                 .iter()
-                .map(|st| TrackView {
-                    track_id: st.track_id,
-                    n_windows: st.n_windows,
-                    immobile_windows: st.immobile_windows,
-                    mobile_windows: st.mobile_windows,
-                    immobile_fraction: st.immobile_fraction,
+                .map(|st| {
+                    let d = durs.get(&st.track_id).copied().unwrap_or(empty);
+                    TrackView {
+                        track_id: st.track_id,
+                        n_windows: st.n_windows,
+                        immobile_windows: st.immobile_windows,
+                        mobile_windows: st.mobile_windows,
+                        immobile_fraction: st.immobile_fraction,
+                        immobile_s: d.immobile_s,
+                        mobile_s: d.mobile_s,
+                        covered_s: d.covered_s,
+                        longest_immobile_s: d.longest_immobile_s,
+                        longest_mobile_s: d.longest_mobile_s,
+                    }
                 })
                 .collect()
         };
@@ -463,6 +491,8 @@ impl SummaryView {
                 e.0 += 1;
             }
         }
+        let durs = crate::pipeline::track_durations(windows);
+        let empty = crate::pipeline::LabelDurations::default();
         Self {
             width: run.width,
             height: run.height,
@@ -494,16 +524,24 @@ impl SummaryView {
             },
             per_track: by_track
                 .into_iter()
-                .map(|(id, (imm, total))| TrackView {
-                    track_id: id,
-                    n_windows: total,
-                    immobile_windows: imm,
-                    mobile_windows: total - imm,
-                    immobile_fraction: if total > 0 {
-                        imm as f32 / total as f32
-                    } else {
-                        0.0
-                    },
+                .map(|(id, (imm, total))| {
+                    let d = durs.get(&id).copied().unwrap_or(empty);
+                    TrackView {
+                        track_id: id,
+                        n_windows: total,
+                        immobile_windows: imm,
+                        mobile_windows: total - imm,
+                        immobile_fraction: if total > 0 {
+                            imm as f32 / total as f32
+                        } else {
+                            0.0
+                        },
+                        immobile_s: d.immobile_s,
+                        mobile_s: d.mobile_s,
+                        covered_s: d.covered_s,
+                        longest_immobile_s: d.longest_immobile_s,
+                        longest_mobile_s: d.longest_mobile_s,
+                    }
                 })
                 .collect(),
         }

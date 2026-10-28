@@ -854,6 +854,100 @@ pub struct TrackWindowStats {
     pub mobile_windows: usize,
     /// `immobile_windows / n_windows`.
     pub immobile_fraction: f32,
+    /// Seconds covered by immobile bouts (overlapping windows merged).
+    #[serde(default)]
+    pub immobile_s: f64,
+    /// Seconds covered by mobile bouts (overlapping windows merged).
+    #[serde(default)]
+    pub mobile_s: f64,
+    /// Total scored span of this track (`immobile_s + mobile_s`).
+    #[serde(default)]
+    pub covered_s: f64,
+    /// Longest continuous immobile bout (seconds).
+    #[serde(default)]
+    pub longest_immobile_s: f64,
+    /// Longest continuous mobile bout (seconds).
+    #[serde(default)]
+    pub longest_mobile_s: f64,
+}
+
+/// Time covered by immobile / mobile bouts of one track.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LabelDurations {
+    /// Total scored span (`immobile_s + mobile_s`).
+    pub covered_s: f64,
+    pub immobile_s: f64,
+    pub mobile_s: f64,
+    pub longest_immobile_s: f64,
+    pub longest_mobile_s: f64,
+}
+
+impl LabelDurations {
+    fn push_bout(&mut self, start: f64, end: f64, immobile: bool) {
+        let d = (end - start).max(0.0);
+        self.covered_s += d;
+        if immobile {
+            self.immobile_s += d;
+            self.longest_immobile_s = self.longest_immobile_s.max(d);
+        } else {
+            self.mobile_s += d;
+            self.longest_mobile_s = self.longest_mobile_s.max(d);
+        }
+    }
+}
+
+/// Merge same-label window spans that touch or overlap into bouts, then sum
+/// their duration.
+///
+/// Windows overlap whenever `stride < window` (the default), so simply adding
+/// `n_windows * window_s` would count the same seconds several times. Two
+/// adjacent windows on the grid also count as one continuous bout, so a run of
+/// immobile windows yields a single bout instead of many tiny ones.
+pub fn label_durations<I>(spans: I) -> LabelDurations
+where
+    I: IntoIterator<Item = (f64, f64, bool)>,
+{
+    let mut items: Vec<(f64, f64, bool)> = spans
+        .into_iter()
+        .filter(|(s, e, _)| s.is_finite() && e.is_finite() && *e > *s)
+        .collect();
+    items.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut out = LabelDurations::default();
+    let mut cur: Option<(f64, f64, bool)> = None;
+    for (s, e, imm) in items {
+        match cur {
+            Some((cs, ce, cimm)) if cimm == imm && s <= ce + 1e-6 => {
+                cur = Some((cs, ce.max(e), cimm));
+            }
+            _ => {
+                if let Some((cs, ce, cimm)) = cur.take() {
+                    out.push_bout(cs, ce, cimm);
+                }
+                cur = Some((s, e, imm));
+            }
+        }
+    }
+    if let Some((cs, ce, cimm)) = cur {
+        out.push_bout(cs, ce, cimm);
+    }
+    out
+}
+
+/// Per-track merged durations from a list of scored windows.
+pub fn track_durations(windows: &[ScoredWindow]) -> HashMap<usize, LabelDurations> {
+    let mut by_track: HashMap<usize, Vec<(f64, f64, bool)>> = HashMap::new();
+    for w in windows {
+        by_track.entry(w.track_id).or_default().push((
+            w.start_t,
+            w.end_t,
+            w.label == crate::classify::ActClass::Immobile,
+        ));
+    }
+    by_track
+        .into_iter()
+        .map(|(id, spans)| (id, label_durations(spans)))
+        .collect()
 }
 
 /// Run tracking, then score every window of every track.
@@ -911,6 +1005,7 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
 
         let mut immobile = 0usize;
         let mut total = 0usize;
+        let mut spans: Vec<(f64, f64, bool)> = Vec::new();
         let mut i = 0usize;
         while i + n <= recs.len() {
             let slice = &recs[i..i + n];
@@ -940,10 +1035,12 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
             let pred = clf.predict(&w.values)?.with_threshold(cfg.threshold);
             let rii = crate::features::rii_score(&samples, crate::features::RII_PIXEL_THRESHOLD);
 
-            if pred.label == crate::classify::ActClass::Immobile {
+            let is_immobile = pred.label == crate::classify::ActClass::Immobile;
+            if is_immobile {
                 immobile += 1;
             }
             total += 1;
+            spans.push((w.start_t, w.end_t, is_immobile));
             windows.push(ScoredWindow {
                 track_id: *tid,
                 start_frame: w.start_frame,
@@ -958,6 +1055,7 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
             i += stride;
         }
         if total > 0 {
+            let d = label_durations(spans);
             per_track.push((*tid, immobile as f32 / total as f32));
             per_track_stats.push(TrackWindowStats {
                 track_id: *tid,
@@ -965,6 +1063,11 @@ pub fn score_tracks(info: &RunInfo, cfg: &AnalyzeConfig) -> Result<AnalyzeReport
                 immobile_windows: immobile,
                 mobile_windows: total - immobile,
                 immobile_fraction: immobile as f32 / total as f32,
+                immobile_s: d.immobile_s,
+                mobile_s: d.mobile_s,
+                covered_s: d.covered_s,
+                longest_immobile_s: d.longest_immobile_s,
+                longest_mobile_s: d.longest_mobile_s,
             });
         }
     }
@@ -1309,11 +1412,44 @@ mod tests {
         assert_eq!(lo.n_windows, low.windows.len());
         assert_eq!(lo.immobile_windows, lo.n_windows);
         assert_eq!(lo.mobile_windows, 0);
+        // Overlapping windows (stride < window) must not double-count time.
+        assert!((lo.immobile_s - lo.covered_s).abs() < 1e-9);
+        assert_eq!(lo.mobile_s, 0.0);
+        assert!((lo.covered_s - 3.84).abs() < 1e-6, "covered={}", lo.covered_s);
 
         let hi = &high.per_track_stats[0];
         assert_eq!(hi.immobile_windows, 0);
         assert_eq!(hi.mobile_windows, hi.n_windows);
+        assert_eq!(hi.immobile_s, 0.0);
+        assert!((hi.mobile_s - hi.covered_s).abs() < 1e-9);
         assert_eq!(high.threshold, 0.99);
         assert_eq!(low.threshold, 0.01);
+    }
+
+    #[test]
+    fn label_durations_merge_overlapping_bouts() {
+        // 0.5 s windows on a 0.25 s grid: overlapping immobile windows count
+        // once, and touching windows of different labels stay separate.
+        let d = label_durations(vec![
+            (0.0, 0.5, true),
+            (0.25, 0.75, true),
+            (0.5, 1.0, true),
+            (1.0, 1.5, false),
+            (1.5, 2.0, false),
+        ]);
+        assert!((d.immobile_s - 1.0).abs() < 1e-9, "{}", d.immobile_s);
+        assert!((d.mobile_s - 1.0).abs() < 1e-9, "{}", d.mobile_s);
+        assert!((d.covered_s - 2.0).abs() < 1e-9);
+        assert!((d.longest_immobile_s - 1.0).abs() < 1e-9);
+        assert!((d.longest_mobile_s - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn label_durations_keep_gaps_when_stride_exceeds_window() {
+        // Non-overlapping windows far apart are two bouts, not one.
+        let d = label_durations(vec![(0.0, 0.5, true), (1.0, 1.5, true)]);
+        assert!((d.immobile_s - 1.0).abs() < 1e-9);
+        assert!((d.covered_s - 1.0).abs() < 1e-9);
+        assert!((d.longest_immobile_s - 0.5).abs() < 1e-9);
     }
 }

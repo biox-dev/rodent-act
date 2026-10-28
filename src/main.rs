@@ -468,12 +468,17 @@ fn print_analysis(report: &pipeline::AnalyzeReport) {
     );
     for s in &report.per_track_stats {
         println!(
-            "  track {}: immobile {}/{} ({:.1}%), mobile {}",
+            "  track {}: immobile {}/{} ({:.1}%, {:.2}s, longest {:.2}s), mobile {} ({:.2}s), \
+             covered {:.2}s",
             s.track_id,
             s.immobile_windows,
             s.n_windows,
             s.immobile_fraction * 100.0,
-            s.mobile_windows
+            s.immobile_s,
+            s.longest_immobile_s,
+            s.mobile_windows,
+            s.mobile_s,
+            s.covered_s
         );
     }
 }

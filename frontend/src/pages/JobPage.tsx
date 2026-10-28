@@ -19,6 +19,14 @@ function pct(v: number | undefined | null): string {
   return `${(v * 100).toFixed(1)}%`;
 }
 
+/** Seconds -> `12.3s` / `1m05.2s`, for the per-track duration columns. */
+function fmtDur(v: number | undefined | null): string {
+  if (v === undefined || v === null || Number.isNaN(v)) return '—';
+  if (v < 60) return `${v.toFixed(1)}s`;
+  const m = Math.floor(v / 60);
+  return `${m}m${(v - m * 60).toFixed(1)}s`;
+}
+
 export default function JobPage() {
   const { id } = useParams<{ id: string }>();
   const { job, progress, liveLogs, refresh } = useJobEvents(id);
@@ -683,7 +691,11 @@ export default function JobPage() {
                       <th>不动窗口</th>
                       <th>活动窗口</th>
                       <th>不动比例</th>
-                      <th style={{ width: '35%' }} />
+                      <th>不动时长</th>
+                      <th>活动时长</th>
+                      <th>最长不动</th>
+                      <th>最长活动</th>
+                      <th style={{ width: '18%' }} />
                     </tr>
                   </thead>
                   <tbody>
@@ -694,6 +706,10 @@ export default function JobPage() {
                         <td>{t.immobile_windows ?? '—'}</td>
                         <td>{t.mobile_windows ?? '—'}</td>
                         <td>{pct(t.immobile_fraction)}</td>
+                        <td className="num">{fmtDur(t.immobile_s)}</td>
+                        <td className="num">{fmtDur(t.mobile_s)}</td>
+                        <td className="num">{fmtDur(t.longest_immobile_s)}</td>
+                        <td className="num">{fmtDur(t.longest_mobile_s)}</td>
                         <td>
                           <div className="progress">
                             <div style={{ width: `${Math.round(t.immobile_fraction * 100)}%` }} />

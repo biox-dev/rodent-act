@@ -33,6 +33,16 @@ export interface TrackView {
   /** Windows labelled mobile. */
   mobile_windows: number;
   immobile_fraction: number;
+  /** Seconds covered by immobile bouts (overlapping windows merged). */
+  immobile_s?: number;
+  /** Seconds covered by mobile bouts (overlapping windows merged). */
+  mobile_s?: number;
+  /** Total scored span of this track (`immobile_s + mobile_s`). */
+  covered_s?: number;
+  /** Longest continuous immobile bout (seconds). */
+  longest_immobile_s?: number;
+  /** Longest continuous mobile bout (seconds). */
+  longest_mobile_s?: number;
 }
 
 export interface SummaryView {
@@ -184,6 +194,13 @@ export interface TrackWindowStats {
   immobile_windows: number;
   mobile_windows: number;
   immobile_fraction: number;
+  /** Seconds covered by immobile bouts (overlapping windows merged). */
+  immobile_s?: number;
+  /** Seconds covered by mobile bouts (overlapping windows merged). */
+  mobile_s?: number;
+  covered_s?: number;
+  longest_immobile_s?: number;
+  longest_mobile_s?: number;
 }
 
 export interface RescoreResponse {
