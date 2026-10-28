@@ -201,7 +201,7 @@ cat dataset/data.yaml
 ./analytics/.venv/bin/python - <<PY
 from ultralytics import YOLO
 
-model = YOLO("models/best.pt")          # COCO 预训练权重作为起点
+model = YOLO("runs/tst/weights/best.pt")          # COCO 预训练权重作为起点
 model.train(
     data="out/datasets/TST2/data.yaml",
     epochs=30,
@@ -210,7 +210,7 @@ model.train(
     device=0,
     single_cls=True,
     project="$PWD/runs",      # ← 绝对路径，见上方说明
-    name="tst",
+    name="tst3",
     exist_ok=True,
     workers=0,
     verbose=True,
@@ -234,7 +234,7 @@ tail -1 runs/tst/results.csv
 
 ./analytics/.venv/bin/python analytics/model_tools.py convert \
   runs/tst/weights/best.pt \
-  --out models/mouse.onnx \
+  --out models/mouse2.onnx \
   --imgsz 480
 
 # 确认类名 —— 打印 {0: 'item'} 之类的单类名字

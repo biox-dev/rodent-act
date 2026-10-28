@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api, type DatasetSummary, type MediaFile, type ServerInfo } from '../api';
+import {
+  AutoLabelFields,
+  autoLabelOptions,
+  defaultAutoLabelConfig,
+  type AutoLabelConfig,
+} from '../components/AutoLabelPanel';
 import ClipRange, { fmtClock } from '../components/ClipRange';
 
 const VIDEO_EXT = /\.(mp4|avi|mov|mkv|webm)$/i;
@@ -42,13 +48,7 @@ export default function DatasetPage() {
   const [previewingClip, setPreviewingClip] = useState(false);
 
   const [autoLabel, setAutoLabel] = useState(true);
-  const [threshold, setThreshold] = useState(45);
-  const [minArea, setMinArea] = useState(0.0008);
-  const [channels, setChannels] = useState(6);
-  const [maxObjects, setMaxObjects] = useState(12);
-  const [useRoi, setUseRoi] = useState(true);
-  const [roi, setRoi] = useState({ x1: 0.1, y1: 0.1, x2: 0.98, y2: 0.95 });
-  const [onlyEmpty, setOnlyEmpty] = useState(false);
+  const [autoCfg, setAutoCfg] = useState<AutoLabelConfig>(defaultAutoLabelConfig);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -162,16 +162,7 @@ export default function DatasetPage() {
         // exact frame count and skips the extra ffmpeg seek options.
         startS: duration > 0 && clipStart > 0.01 ? clipStart : undefined,
         endS: duration > 0 && clipEnd < duration - 0.01 ? clipEnd : undefined,
-        autolabel: autoLabel
-          ? {
-              threshold,
-              minArea,
-              maxObjects,
-              channels,
-              roi: useRoi ? [roi.x1, roi.y1, roi.x2, roi.y2] : undefined,
-              onlyEmpty,
-            }
-          : undefined,
+        autolabel: autoLabel ? autoLabelOptions(autoCfg) : undefined,
       });
       const auto = res.autolabel
         ? `，预标注 ${res.autolabel.boxes} 个框（${res.autolabel.images} 帧）`
@@ -440,96 +431,7 @@ export default function DatasetPage() {
           />
           抽帧后自动生成初始框（比全图更暗的连通域）
         </label>
-        {autoLabel && (
-          <>
-            <div className="row">
-              <label className="field">
-                暗度阈值
-                <input
-                  type="number"
-                  min={1}
-                  max={120}
-                  value={threshold}
-                  onChange={(e) => setThreshold(Number(e.target.value) || 45)}
-                />
-                <span className="hint">
-                  比全图中位亮度暗多少算目标。调高更保守，调低更灵敏。
-                </span>
-              </label>
-              <label className="field">
-                最小面积比例
-                <input
-                  type="number"
-                  step={0.0002}
-                  value={minArea}
-                  onChange={(e) => setMinArea(Number(e.target.value) || 0.0008)}
-                />
-                <span className="hint">过滤反光/噪点，0.0008 ≈ 640×480 下约 245 像素。</span>
-              </label>
-              <label className="field">
-                每帧最多几个通道
-                <input
-                  type="number"
-                  min={0}
-                  value={channels}
-                  onChange={(e) => setChannels(Math.max(0, Number(e.target.value) || 0))}
-                />
-                <span className="hint">装置是 6 通道就填 6；0 = 不限制。</span>
-              </label>
-              <label className="field">
-                候选上限
-                <input
-                  type="number"
-                  min={1}
-                  value={maxObjects}
-                  onChange={(e) => setMaxObjects(Math.max(1, Number(e.target.value) || 12))}
-                />
-              </label>
-              <label className="field checkbox">
-                <input
-                  type="checkbox"
-                  checked={onlyEmpty}
-                  onChange={(e) => setOnlyEmpty(e.target.checked)}
-                />
-                只标空帧（不覆盖已有框）
-              </label>
-            </div>
-            <label className="field checkbox" style={{ marginTop: 10 }}>
-              <input
-                type="checkbox"
-                checked={useRoi}
-                onChange={(e) => setUseRoi(e.target.checked)}
-              />
-              限制 ROI（推荐，去掉灯管/线缆/手）
-            </label>
-            {useRoi && (
-              <div className="row" style={{ marginTop: 8 }}>
-                {(
-                  [
-                    ['x1', '左'],
-                    ['y1', '上'],
-                    ['x2', '右'],
-                    ['y2', '下'],
-                  ] as const
-                ).map(([key, label]) => (
-                  <label className="field" key={key}>
-                    ROI {label} ({key})
-                    <input
-                      type="number"
-                      min={0}
-                      max={1}
-                      step={0.01}
-                      value={roi[key]}
-                      onChange={(e) =>
-                        setRoi((r) => ({ ...r, [key]: Number(e.target.value) || 0 }))
-                      }
-                    />
-                  </label>
-                ))}
-              </div>
-            )}
-          </>
-        )}
+        {autoLabel && <AutoLabelFields value={autoCfg} onChange={setAutoCfg} />}
 
         <div className="row" style={{ marginTop: 16 }}>
           <button onClick={submit} disabled={busy || !video || !clipOk}>
@@ -601,7 +503,8 @@ export default function DatasetPage() {
         )}
         <div className="hint" style={{ marginTop: 10, fontSize: 11 }}>
           补充样本：在任务视频页暂停到某一帧，点「加入训练集」即可把该帧画面与检测框直接写入所选数据集的
-          <code> raw/ </code>，适合把模型判错的帧补进训练集做 fine-tune。
+          <code> raw/ </code>，写入后会直接跳转到标注编辑器并定位到该帧（可取消勾选），
+          适合把模型判错的帧补进训练集做 fine-tune。
           标注完成后在编辑器里点「划分训练/验证集」，会生成
           <code> images/labels/{'{train,val}'} </code> 和 <code>data.yaml</code>，
           可直接用于 <code>analytics/model_tools.py fine-tune</code> 或 Ultralytics 训练。

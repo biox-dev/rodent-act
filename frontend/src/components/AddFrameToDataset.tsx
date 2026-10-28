@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Checkbox, Input, InputNumber, Modal, Select } from 'antd';
 import { api, type DatasetSummary, type LabelBox } from '../api';
 
@@ -31,6 +32,7 @@ interface Props {
  * frames can be re-used for fine-tuning.
  */
 export default function AddFrameToDataset({ capture, prefix, disabled, disabledHint }: Props) {
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [shot, setShot] = useState<CapturedFrame | null>(null);
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
@@ -41,12 +43,26 @@ export default function AddFrameToDataset({ capture, prefix, disabled, disabledH
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
+  /** Dataset + image written by the last successful submit. */
+  const [saved, setSaved] = useState<{ dataset: string; image: string } | null>(null);
+  /** Jump into the label editor right after a successful write. */
+  const [openAfterSave, setOpenAfterSave] = useState(true);
+
+  /** `/datasets/<name>?frame=<image>` opens the editor on that frame. */
+  const editorHref = (dataset: string, image: string) =>
+    `/datasets/${encodeURIComponent(dataset)}?frame=${encodeURIComponent(image)}`;
+
+  const openEditor = (dataset: string, image: string) => {
+    setOpen(false);
+    navigate(editorHref(dataset, image));
+  };
 
   const start = () => {
     const grabbed = capture();
     setShot(grabbed);
     setError(grabbed ? null : '拿不到当前画面：请先播放/拖动视频到有画面的位置');
     setDone(null);
+    setSaved(null);
     setOverwrite(false);
     // Default to the dataset extracted from this same video, if any.
     setName((prev) => (prev.trim() ? prev : (prefix ?? '')));
@@ -106,11 +122,13 @@ export default function AddFrameToDataset({ capture, prefix, disabled, disabledH
           `${res.dataset.nImages} 帧 / ${res.dataset.nBoxes} 个框` +
           (res.overwritten ? ' · 已覆盖同名帧' : ''),
       );
+      setSaved({ dataset: res.dataset.name, image: res.image });
       setDatasets((prev) =>
         [...prev.filter((d) => d.name !== res.dataset.name), res.dataset].sort((a, b) =>
           a.name.localeCompare(b.name),
         ),
       );
+      if (openAfterSave) openEditor(res.dataset.name, res.image);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -202,6 +220,14 @@ export default function AddFrameToDataset({ capture, prefix, disabled, disabledH
                   覆盖同名帧
                 </Checkbox>
               </label>
+              <label className="field checkbox">
+                <Checkbox
+                  checked={openAfterSave}
+                  onChange={(e) => setOpenAfterSave(e.target.checked)}
+                >
+                  写入后直接打开标注编辑器
+                </Checkbox>
+              </label>
               <span className="hint" style={{ fontSize: 11, alignSelf: 'center' }}>
                 写入 <code>raw/</code>；若数据集已划分，请到标注编辑器重新划分训练/验证集。
               </span>
@@ -211,6 +237,15 @@ export default function AddFrameToDataset({ capture, prefix, disabled, disabledH
             {done && <div className="ok-box" style={{ marginTop: 12 }}>{done}</div>}
 
             <div className="row" style={{ marginTop: 16, justifyContent: 'flex-end' }}>
+              {saved && (
+                <button
+                  className="ghost"
+                  onClick={() => openEditor(saved.dataset, saved.image)}
+                  title="打开标注编辑器并定位到刚写入的这一帧"
+                >
+                  打开标注编辑器
+                </button>
+              )}
               <button className="ghost" onClick={() => setOpen(false)}>
                 关闭
               </button>

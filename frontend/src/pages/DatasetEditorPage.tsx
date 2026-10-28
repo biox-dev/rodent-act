@@ -1,16 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import {
-  api,
-  type CheckReport,
-  type DatasetFrame,
-  type LabelBox,
-  type SplitReport,
-} from '../api';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { api, type DatasetFrame, type LabelBox } from '../api';
+import AutoLabelPanel from '../components/AutoLabelPanel';
 import BoxEditor from '../components/BoxEditor';
+import DatasetSplitPanel from '../components/DatasetSplitPanel';
+import LabelToolbar, { type SaveState } from '../components/LabelToolbar';
 
 export default function DatasetEditorPage() {
   const { name = '' } = useParams();
+  // `?frame=<image>` deep-links to one frame (used by the "加入训练集" dialog).
+  const [params, setParams] = useSearchParams();
 
   const [frames, setFrames] = useState<DatasetFrame[]>([]);
   const [dir, setDir] = useState('');
@@ -29,23 +28,6 @@ export default function DatasetEditorPage() {
   const [onlyEmpty, setOnlyEmpty] = useState(false);
   const [filterText, setFilterText] = useState('');
 
-  const [autoThreshold, setAutoThreshold] = useState(45);
-  const [autoMinArea, setAutoMinArea] = useState(0.0008);
-  const [autoMaxObjects, setAutoMaxObjects] = useState(12);
-  const [autoChannels, setAutoChannels] = useState(6);
-  const [autoOnlyEmpty, setAutoOnlyEmpty] = useState(false);
-  const [useAutoRoi, setUseAutoRoi] = useState(true);
-  const [roi, setRoi] = useState({ x1: 0.1, y1: 0.1, x2: 0.98, y2: 0.95 });
-  const [autoBusy, setAutoBusy] = useState(false);
-
-  const [valFrac, setValFrac] = useState(0.2);
-  const [seed, setSeed] = useState(0);
-  const [className, setClassName] = useState('mouse');
-  const [splitBusy, setSplitBusy] = useState(false);
-  const [split, setSplit] = useState<SplitReport | null>(null);
-  const [check, setCheck] = useState<CheckReport | null>(null);
-  const [checkBusy, setCheckBusy] = useState(false);
-
   // Frames can be moved into train/val one by one; requires an existing split.
   const [hasSplit, setHasSplit] = useState(false);
   const [assignBusy, setAssignBusy] = useState(false);
@@ -55,6 +37,8 @@ export default function DatasetEditorPage() {
   const dirtyRef = useRef(false);
   const indexRef = useRef(0);
   const framesRef = useRef<DatasetFrame[]>([]);
+  // Scroll container of the frame list, so the active row can be revealed.
+  const listRef = useRef<HTMLDivElement>(null);
 
   const applyCounts = useCallback((next: Record<string, number>) => {
     setCounts(next);
@@ -102,8 +86,36 @@ export default function DatasetEditorPage() {
   const frame = frames[index];
   const frameLabel = frame?.label ?? '';
   const member = frame?.split ?? null;
-  const inTrain = member === 'train' || member === 'both';
-  const inVal = member === 'val' || member === 'both';
+
+  // Deep link: jump to `?frame=<image>` once the frame list is known, then drop
+  // the parameter so a later refresh does not jump back.
+  const wantedFrame = params.get('frame');
+  const appliedFrame = useRef<string | null>(null);
+  useEffect(() => {
+    if (!wantedFrame || appliedFrame.current === wantedFrame || !frames.length) return;
+    appliedFrame.current = wantedFrame;
+    const i = frames.findIndex((f) => f.name === wantedFrame);
+    if (i >= 0) {
+      indexRef.current = i;
+      setIndex(i);
+      setSelected(null);
+      setNotice(`已定位到 ${wantedFrame}`);
+    } else {
+      setNotice(`没有找到帧 ${wantedFrame}（可能已被删除或覆盖）`);
+    }
+    const next = new URLSearchParams(params);
+    next.delete('frame');
+    setParams(next, { replace: true });
+  }, [wantedFrame, frames, params, setParams]);
+
+  // Keep the active frame visible in the (scrollable) list.
+  useEffect(() => {
+    const box = listRef.current;
+    const el = box?.querySelector<HTMLElement>('button.active');
+    if (!box || !el) return;
+    const top = el.offsetTop - box.offsetTop - box.clientHeight / 2 + el.clientHeight / 2;
+    box.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+  }, [index, frames.length]);
 
   // Load the labels of the current frame.
   useEffect(() => {
@@ -290,70 +302,6 @@ export default function DatasetEditorPage() {
     }
   };
 
-  const runAutolabel = async () => {
-    setAutoBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const res = await api.autolabelDataset(name, {
-        threshold: autoThreshold,
-        minArea: autoMinArea,
-        maxObjects: autoMaxObjects,
-        channels: autoChannels,
-        roi: useAutoRoi ? [roi.x1, roi.y1, roi.x2, roi.y2] : undefined,
-        onlyEmpty: autoOnlyEmpty,
-      });
-      setNotice(
-        `预标注完成：${res.report.images} 帧 / ${res.report.boxes} 个框` +
-          (res.report.empty ? `（${res.report.empty} 帧没有候选）` : ''),
-      );
-      await reload();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAutoBusy(false);
-    }
-  };
-
-  const runSplit = async () => {
-    setSplitBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      await saveNow();
-      const res = await api.splitDataset(name, { valFrac, seed, className });
-      setSplit(res.split);
-      setCheck(res.check);
-      // The split reassigns every frame, so refresh the per-frame train/val
-      // badges (and enable the manual assign buttons).
-      await loadFrames();
-      setNotice(`已生成训练集：train=${res.split.train} val=${res.split.val}`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSplitBusy(false);
-    }
-  };
-
-  const runCheck = async () => {
-    setCheckBusy(true);
-    setError(null);
-    try {
-      await saveNow();
-      const r = await api.checkDataset(name);
-      setCheck(r);
-      setNotice(
-        r.ok
-          ? `校验通过：${r.images} 张图 / ${r.boxes} 个框`
-          : `发现 ${r.problems.length} 个问题`,
-      );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setCheckBusy(false);
-    }
-  };
-
   const totalBoxes = useMemo(
     () => Object.values(counts).reduce((a, b) => a + b, 0),
     [counts],
@@ -362,6 +310,9 @@ export default function DatasetEditorPage() {
     () => frames.filter((f) => (counts[f.label] ?? 0) === 0).length,
     [frames, counts],
   );
+
+  // Mirrors the debounced auto-save for the toolbar indicator.
+  const saveState: SaveState = saving ? 'saving' : dirty ? 'dirty' : savedAt ? 'saved' : 'idle';
 
   if (loading) {
     return (
@@ -412,7 +363,7 @@ export default function DatasetEditorPage() {
             value={filterText}
             onChange={(e) => setFilterText(e.target.value)}
           />
-          <div className="frame-list">
+          <div className="frame-list" ref={listRef}>
             {visible.map(({ f, i }) => {
               const n = counts[f.label] ?? f.boxes;
               return (
@@ -447,58 +398,23 @@ export default function DatasetEditorPage() {
         </div>
 
         <div className="card">
-          <div className="editor-toolbar">
-            <button className="ghost" onClick={() => step(-1)} disabled={!hasPrev}>
-              ← 上一帧
-            </button>
-            <button className="ghost" onClick={() => step(1)} disabled={!hasNext}>
-              下一帧 →
-            </button>
-            <span className="mono muted">
-              {frames.length ? index + 1 : 0} / {frames.length}
-            </span>
-            {hasSplit && (
-              <span className="frame-split-state">
-                {inTrain && <em className="split-chip train">train</em>}
-                {inVal && <em className="split-chip val">val</em>}
-                {!inTrain && !inVal && <span className="muted">未分配</span>}
-              </span>
-            )}
-            <span className="spacer" />
-            <button className="ghost" onClick={() => void copyPrevious()} disabled={index === 0}>
-              复制上一帧
-            </button>
-            <button
-              className="ghost"
-              onClick={() => void assignCurrent('train')}
-              disabled={assignBusy || !frame || !hasSplit}
-              title="把当前帧复制到 images/train（同时从 val 移除）"
-            >
-              移入训练集
-            </button>
-            <button
-              className="ghost"
-              onClick={() => void assignCurrent('val')}
-              disabled={assignBusy || !frame || !hasSplit}
-              title="把当前帧复制到 images/val（同时从 train 移除）"
-            >
-              移入验证集
-            </button>
-            <button
-              className="ghost"
-              onClick={() => void assignCurrent('none')}
-              disabled={assignBusy || !frame || (!inTrain && !inVal)}
-              title="从 images/train 和 images/val 中移除（保留 raw/ 原图）"
-            >
-              移出划分
-            </button>
-            <button className="ghost" onClick={() => applyBoxes([])} disabled={!boxes.length}>
-              清空
-            </button>
-            <span className="save-chip">
-              {saving ? '保存中…' : dirty ? '未保存…' : savedAt ? '已保存 ✓' : ''}
-            </span>
-          </div>
+          <LabelToolbar
+            index={index}
+            count={frames.length}
+            hasPrev={hasPrev}
+            hasNext={hasNext}
+            onStep={step}
+            frameName={frame?.name ?? null}
+            hasSplit={hasSplit}
+            member={member}
+            boxCount={boxes.length}
+            onClear={() => applyBoxes([])}
+            onAssign={(target) => void assignCurrent(target)}
+            assignBusy={assignBusy}
+            canCopyPrevious={index > 0}
+            onCopyPrevious={() => void copyPrevious()}
+            saveState={saveState}
+          />
 
           {!hasSplit && (
             <div className="hint" style={{ marginTop: 6, fontSize: 11 }}>
@@ -537,179 +453,29 @@ export default function DatasetEditorPage() {
         </div>
 
         <div className="dataset-side">
-          <div className="card">
-            <h3>
-              自动预标注<span className="sub">覆盖当前 .txt</span>
-            </h3>
-            <div className="row">
-              <label className="field">
-                暗度阈值
-                <input
-                  type="number"
-                  min={1}
-                  max={120}
-                  value={autoThreshold}
-                  onChange={(e) => setAutoThreshold(Number(e.target.value) || 45)}
-                />
-              </label>
-              <label className="field">
-                最小面积
-                <input
-                  type="number"
-                  step={0.0002}
-                  value={autoMinArea}
-                  onChange={(e) => setAutoMinArea(Number(e.target.value) || 0.0008)}
-                />
-              </label>
-              <label className="field">
-                通道数
-                <input
-                  type="number"
-                  min={0}
-                  value={autoChannels}
-                  onChange={(e) => setAutoChannels(Math.max(0, Number(e.target.value) || 0))}
-                />
-              </label>
-              <label className="field">
-                候选上限
-                <input
-                  type="number"
-                  min={1}
-                  value={autoMaxObjects}
-                  onChange={(e) => setAutoMaxObjects(Math.max(1, Number(e.target.value) || 12))}
-                />
-              </label>
-            </div>
-            <label className="field checkbox" style={{ marginTop: 8 }}>
-              <input
-                type="checkbox"
-                checked={autoOnlyEmpty}
-                onChange={(e) => setAutoOnlyEmpty(e.target.checked)}
-              />
-              只标空帧（保留手工标注）
-            </label>
-            <label className="field checkbox">
-              <input
-                type="checkbox"
-                checked={useAutoRoi}
-                onChange={(e) => setUseAutoRoi(e.target.checked)}
-              />
-              使用 ROI
-            </label>
-            {useAutoRoi && (
-              <div className="row">
-                {(
-                  [
-                    ['x1', '左'],
-                    ['y1', '上'],
-                    ['x2', '右'],
-                    ['y2', '下'],
-                  ] as const
-                ).map(([key, label]) => (
-                  <label className="field" key={key}>
-                    {label}
-                    <input
-                      type="number"
-                      min={0}
-                      max={1}
-                      step={0.01}
-                      value={roi[key]}
-                      onChange={(e) =>
-                        setRoi((r) => ({ ...r, [key]: Number(e.target.value) || 0 }))
-                      }
-                    />
-                  </label>
-                ))}
-              </div>
-            )}
-            <div className="row" style={{ marginTop: 10 }}>
-              <button onClick={() => void runAutolabel()} disabled={autoBusy || !frames.length}>
-                {autoBusy ? '标注中…' : '开始预标注'}
-              </button>
-            </div>
-            <div className="hint" style={{ marginTop: 8, fontSize: 11 }}>
-              预标注会写回每张图的 <code>.txt</code>；已手工修正的帧请勾选「只标空帧」。
-            </div>
-          </div>
+          <AutoLabelPanel
+            disabled={!frames.length}
+            disabledHint="数据集里还没有图片"
+            onRun={async (opts) => {
+              const res = await api.autolabelDataset(name, opts);
+              await reload();
+              return (
+                `预标注完成：${res.report.images} 帧 / ${res.report.boxes} 个框` +
+                (res.report.empty ? `（${res.report.empty} 帧没有候选）` : '')
+              );
+            }}
+          />
 
-          <div className="card">
-            <h3>
-              校验与划分<span className="sub">生成 data.yaml</span>
-            </h3>
-            <div className="row">
-              <label className="field">
-                验证集比例
-                <input
-                  type="number"
-                  min={0.01}
-                  max={0.9}
-                  step={0.05}
-                  value={valFrac}
-                  onChange={(e) => setValFrac(Math.min(0.9, Math.max(0.01, Number(e.target.value) || 0.2)))}
-                />
-              </label>
-              <label className="field">
-                随机种子
-                <input
-                  type="number"
-                  value={seed}
-                  onChange={(e) => setSeed(Math.max(0, Number(e.target.value) || 0))}
-                />
-              </label>
-              <label className="field">
-                类别名
-                <input value={className} onChange={(e) => setClassName(e.target.value)} />
-              </label>
-            </div>
-            <div className="row" style={{ marginTop: 10 }}>
-              <button className="ghost" onClick={() => void runCheck()} disabled={checkBusy}>
-                {checkBusy ? '校验中…' : '校验数据集'}
-              </button>
-              <button onClick={() => void runSplit()} disabled={splitBusy || !frames.length}>
-                {splitBusy ? '划分中…' : '划分训练/验证集'}
-              </button>
-            </div>
-            {split && (
-              <div className="ok-box" style={{ marginTop: 10 }}>
-                train={split.train} · val={split.val}
-                <div className="mono" style={{ marginTop: 4, wordBreak: 'break-all' }}>
-                  {split.dataYaml}
-                </div>
-              </div>
-            )}
-            {check && (
-              <div
-                className={check.ok ? 'ok-box' : 'error-box'}
-                style={{ marginTop: 10, fontSize: 12 }}
-              >
-                scope={check.scope} · images={check.images} · labels={check.labeled} · boxes=
-                {check.boxes} · empty={check.emptyImages}
-                {check.problems.slice(0, 8).map((p) => (
-                  <div key={p} className="mono">
-                    {p}
-                  </div>
-                ))}
-                {check.problems.length > 8 && (
-                  <div className="mono">… 还有 {check.problems.length - 8} 个问题</div>
-                )}
-                {check.warnings.map((w) => (
-                  <div key={w} className="mono" style={{ color: 'var(--warn)' }}>
-                    ⚠ {w}
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="hint" style={{ marginTop: 8, fontSize: 11 }}>
-              划分会先清空 <code>images/</code> 与 <code>labels/</code>，再按
-              <code> raw/</code> 重新拷贝。生成后可直接训练：
-              <div className="mono" style={{ marginTop: 4, wordBreak: 'break-all' }}>
-                python analytics/model_tools.py fine-tune --data dataset/data.yaml
-              </div>
-              <div style={{ marginTop: 4 }}>
-                注意：重新划分会按随机种子重新分配，覆盖编辑器里手动「移入训练集/验证集」的结果。
-              </div>
-            </div>
-          </div>
+          <DatasetSplitPanel
+            name={name}
+            disabled={!frames.length}
+            flush={saveNow}
+            onSplit={async () => {
+              // The split re-assigns every frame, so refresh the per-frame
+              // train/val badges (and enable the manual assign buttons).
+              await loadFrames();
+            }}
+          />
         </div>
       </div>
     </div>
