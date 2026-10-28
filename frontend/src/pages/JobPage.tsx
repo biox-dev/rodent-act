@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
+import { Badge, Tabs } from 'antd';
 import { api, type LogRecord, type ScoredWindow } from '../api';
 import SeriesChart from '../components/SeriesChart';
 import Timeline from '../components/Timeline';
 import TrackFilter from '../components/TrackFilter';
 import { fmtClock } from '../components/ClipRange';
 import { TrackingOverlay } from '../components/TrackingOverlay';
+import WindowGuide from '../components/WindowGuide';
 import { isTerminal, useAnalysis, useFrameStream, useJobEvents, useLiveWindows } from '../hooks';
 
 function fmtTime(ms: number): string {
@@ -421,6 +423,39 @@ export default function JobPage() {
           </div>
 
           <div className="card">
+            <Tabs
+              size="small"
+              defaultActiveKey="guide"
+              items={[
+                {
+                  key: 'guide',
+                  label: '计算原理',
+                  children: (
+                    <WindowGuide
+                      windowS={job?.window_s}
+                      strideS={job?.stride_s}
+                      threshold={job?.threshold}
+                      fps={fps}
+                    />
+                  ),
+                },
+                {
+                  key: 'logs',
+                  label: (
+                    <span>
+                      运行日志 / 窗口明细
+                      {hasWindows && (
+                        <Badge
+                          count={windows.length}
+                          size="small"
+                          overflowCount={9999}
+                          style={{ marginLeft: 8 }}
+                        />
+                      )}
+                    </span>
+                  ),
+                  children: (
+                    <>
             <h3>
               运行日志
               <span className="sub">来自 pipeline 的 tracing 事件（SSE 实时推送）</span>
@@ -497,7 +532,11 @@ export default function JobPage() {
             <pre style={{ whiteSpace: 'pre', fontFamily: 'monospace', overflow: 'auto' }}>
               {JSON.stringify(frameRecords, null, 2)}
             </pre>
-          
+                    </>
+                  ),
+                },
+              ]}
+            />
           </div>
         </div>
 

@@ -639,6 +639,160 @@ tbody tr:hover {
   font-variant-numeric: tabular-nums;
 }
 
+/* ------------------------------ markdown docs ---------------------------- */
+
+/* Long-form documentation (README tab). Rendered by `MarkdownDoc`. */
+.markdown-body {
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  margin: 22px 0 10px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.markdown-body h1 {
+  font-size: 19px;
+  margin-top: 0;
+}
+
+.markdown-body h2 {
+  font-size: 16px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.markdown-body h3 {
+  font-size: 14px;
+}
+
+.markdown-body h4 {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.markdown-body p {
+  margin: 10px 0;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin: 10px 0;
+  padding-left: 22px;
+}
+
+.markdown-body li {
+  margin: 4px 0;
+}
+
+.markdown-body strong {
+  color: #fff;
+  font-weight: 650;
+}
+
+.markdown-body code {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: #9fe8c9;
+  white-space: nowrap;
+}
+
+.markdown-body pre {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.markdown-body pre code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  white-space: pre;
+}
+
+.markdown-body blockquote {
+  margin: 12px 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent-2);
+  border-radius: 0 6px 6px 0;
+  background: rgba(74, 168, 255, 0.07);
+}
+
+.markdown-body blockquote p {
+  margin: 0;
+}
+
+.markdown-body table {
+  margin: 12px 0;
+  font-size: 12.5px;
+}
+
+.markdown-body table th,
+.markdown-body table td {
+  white-space: normal;
+  vertical-align: top;
+  padding: 6px 10px;
+}
+
+.markdown-body hr {
+  margin: 22px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+/* KaTeX display blocks can be wider than the card on narrow screens. */
+.markdown-body .katex {
+  font-size: 1.06em;
+}
+
+.markdown-body .katex-display {
+  margin: 14px 0;
+  padding: 4px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.window-guide .ant-descriptions-item-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.window-guide .ant-descriptions-item-content {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* antd Tabs inside a card: keep the header compact and on-palette. */
+.card .ant-tabs-nav {
+  margin-bottom: 14px;
+}
+
+.card .ant-tabs-tab {
+  font-size: 13px;
+  padding: 8px 4px;
+}
+
+.card .ant-tabs-tab + .ant-tabs-tab {
+  margin-left: 20px;
+}
+
+.card .ant-tabs-tab .ant-badge {
+  margin-left: 6px;
+}
+
 /* ------------------------------ clip editor ------------------------------ */
 
 .clip-layout {

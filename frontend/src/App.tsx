@@ -1,3 +1,4 @@
+import { ConfigProvider, theme } from 'antd';
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom';
 import DatasetEditorPage from './pages/DatasetEditorPage';
 import DatasetPage from './pages/DatasetPage';
@@ -7,7 +8,26 @@ import NewJobPage from './pages/NewJobPage';
 
 export default function App() {
   return (
-    <div className="app">
+    <ConfigProvider
+      theme={{
+        algorithm: theme.darkAlgorithm,
+        token: {
+          // Keep antd components on the same palette as the hand-written CSS.
+          colorPrimary: '#29d398',
+          colorInfo: '#4aa8ff',
+          colorBgContainer: '#121821',
+          colorBgElevated: '#17202c',
+          colorBorder: '#243040',
+          colorBorderSecondary: '#243040',
+          colorText: '#e6edf3',
+          colorTextSecondary: '#8b9bb0',
+          borderRadius: 8,
+          fontFamily:
+            "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif",
+        },
+      }}
+    >
+      <div className="app">
       <header className="topbar">
         <div className="brand">
           rodent<span>-act</span>
@@ -32,6 +52,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
-    </div>
+      </div>
+    </ConfigProvider>
   );
 }
