@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Badge, Tabs } from 'antd';
-import { api, type LogRecord, type ScoredWindow } from '../api';
+import { api, type LabelBox, type LogRecord, type ScoredWindow } from '../api';
+import AddFrameToDataset, { type CapturedFrame } from '../components/AddFrameToDataset';
 import SeriesChart from '../components/SeriesChart';
 import Timeline from '../components/Timeline';
 import TrackFilter from '../components/TrackFilter';
@@ -118,6 +119,47 @@ export default function JobPage() {
     },
     [clipStart],
   );
+
+  // Boxes are in analysis pixels, which can differ from the video's natural
+  // size (max_side downscale); normalising by the analysis size keeps the
+  // labels correct at any resolution.
+  const analysisW = analysis.records?.width ?? job?.summary?.width ?? 0;
+  const analysisH = analysis.records?.height ?? job?.summary?.height ?? 0;
+
+  /** Grab the frame shown right now + its tracked boxes for the dataset. */
+  const captureFrame = useCallback((): CapturedFrame | null => {
+    const v = videoRef.current;
+    if (!v || v.videoWidth === 0 || v.videoHeight === 0) return null;
+    const scale = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+    const w = Math.max(1, Math.round(v.videoWidth * scale));
+    const h = Math.max(1, Math.round(v.videoHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.drawImage(v, 0, 0, w, h);
+    const boxes: LabelBox[] =
+      analysisW > 0 && analysisH > 0
+        ? (frameRecords ?? [])
+            .map((r) => ({
+              classId: 0,
+              xc: (r.x1 + r.x2) / 2 / analysisW,
+              yc: (r.y1 + r.y2) / 2 / analysisH,
+              w: (r.x2 - r.x1) / analysisW,
+              h: (r.y2 - r.y1) / analysisH,
+            }))
+            .filter((b) => b.w > 0.001 && b.h > 0.001 && b.w <= 1 && b.h <= 1)
+        : [];
+    return {
+      dataUrl: canvas.toDataURL('image/jpeg', 0.9),
+      width: w,
+      height: h,
+      // Absolute source frame index, matching `extract`'s file naming.
+      frame: Math.max(0, Math.round(currentTime * fps)),
+      boxes,
+    };
+  }, [analysisW, analysisH, frameRecords, currentTime, fps]);
 
   useEffect(() => {
     if (!done) return;
@@ -426,6 +468,16 @@ export default function JobPage() {
                 ) : (
                   <span className="muted">该帧无检测</span>
                 )}
+                <AddFrameToDataset
+                  capture={captureFrame}
+                  prefix={job?.input_name.replace(/\.[^.]+$/, '')}
+                  disabled={!analysis.records || !inClip}
+                  disabledHint={
+                    !analysis.records
+                      ? '检测记录尚未加载完成'
+                      : '当前播放位置不在分析区间内'
+                  }
+                />
               </div>
             )}
           </div>

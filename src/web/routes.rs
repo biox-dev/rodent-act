@@ -8,13 +8,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use axum::body::Body;
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
+use image::ImageEncoder as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
@@ -1091,6 +1092,35 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Dependency-free base64 decoder (RFC 4648). Whitespace is ignored and both
+/// the standard and URL-safe alphabets are accepted, so `canvas.toDataURL`
+/// payloads decode without a third-party crate.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 // --------------------------------------------------------------------------- //
 // dataset endpoints (extract / autolabel / review / split / check)
 // --------------------------------------------------------------------------- //
@@ -1388,6 +1418,145 @@ async fn dataset_put_labels(
     }
 }
 
+/// `POST /api/datasets/{name}/capture` - one frame from a job's player.
+///
+/// The browser sends the JPEG it grabbed from the `<video>` plus the tracked
+/// boxes of that frame, so the reviewer can grow a dataset with the exact
+/// frames the current model gets wrong (fine-tuning). The image is re-encoded
+/// to a plain JPEG and stored next to a YOLO `.txt`, exactly like `extract`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureFrameRequest {
+    /// Base64 JPEG/PNG, either bare or as a `data:image/...;base64,` URL.
+    image: String,
+    #[serde(default)]
+    boxes: Vec<dataset::LabelBox>,
+    /// File-name prefix (defaults to `frame`).
+    #[serde(default)]
+    prefix: Option<String>,
+    /// Source frame index written into the file name.
+    #[serde(default)]
+    frame: Option<usize>,
+    /// Replace an existing image/label pair with the same name.
+    #[serde(default)]
+    overwrite: Option<bool>,
+}
+
+async fn dataset_capture(
+    State(st): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    Json(req): Json<CaptureFrameRequest>,
+) -> Response {
+    let Some(root) = dataset_dir(&st, &name) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid dataset name");
+    };
+    if req.boxes.len() > 200 {
+        return api_error(StatusCode::BAD_REQUEST, "too many boxes (max 200)");
+    }
+    for (i, b) in req.boxes.iter().enumerate() {
+        if !b.is_valid() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("box {i} has invalid values: {b:?}"),
+            );
+        }
+    }
+
+    // `canvas.toDataURL("image/jpeg")` prefixes a data URL; accept both forms.
+    let payload = match req.image.split_once(',') {
+        Some((head, tail)) if head.starts_with("data:") => tail,
+        _ => req.image.as_str(),
+    };
+    if payload.len() > 16 * 1024 * 1024 {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image is too large (max 16 MB of base64)",
+        );
+    }
+    let Some(bytes) = base64_decode(payload) else {
+        return api_error(StatusCode::BAD_REQUEST, "image is not valid base64");
+    };
+
+    let prefix = dataset::sanitize_name(req.prefix.as_deref().unwrap_or("frame"));
+    let index = req.frame.unwrap_or(0);
+    let raw = root.join("raw");
+    if let Err(e) = std::fs::create_dir_all(&raw) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("creating {}: {e}", raw.display()),
+        );
+    }
+    let image_path = raw.join(format!("{prefix}_{index:06}.jpg"));
+    let label_path = dataset::label_path_for(&image_path);
+    let existed = image_path.exists();
+    let file_name = image_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if existed && !req.overwrite.unwrap_or(false) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("{file_name} 已存在，勾选「覆盖同名帧」后重试"),
+        );
+    }
+
+    // Re-encode instead of storing the upload verbatim: the browser picks the
+    // format, but a dataset must stay a uniform JPEG set.
+    let decoded = match image::load_from_memory(&bytes) {
+        Ok(img) => img.to_rgb8(),
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("unsupported image: {e}")),
+    };
+    let (width, height) = (decoded.width(), decoded.height());
+    let mut jpeg = Vec::new();
+    if let Err(e) = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 92).write_image(
+        decoded.as_raw(),
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+    ) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encoding jpeg: {e}"),
+        );
+    }
+    if let Err(e) = std::fs::write(&image_path, &jpeg) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("writing {}: {e}", image_path.display()),
+        );
+    }
+    if let Err(e) = dataset::write_labels(&label_path, &req.boxes) {
+        // Keep the pair consistent: an image without its label file would
+        // silently turn into a negative sample.
+        let _ = std::fs::remove_file(&image_path);
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("writing labels: {e}"),
+        );
+    }
+
+    tracing::info!(
+        dataset = %name,
+        frame = index,
+        boxes = req.boxes.len(),
+        overwrite = existed,
+        "frame captured into dataset"
+    );
+    Json(serde_json::json!({
+        "dataset": dataset::summarize(&root, &name),
+        "image": file_name,
+        "label": label_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        "boxes": req.boxes.len(),
+        "width": width,
+        "height": height,
+        "overwritten": existed,
+    }))
+    .into_response()
+}
+
 async fn dataset_autolabel(
     State(st): State<AppState>,
     UrlPath(name): UrlPath<String>,
@@ -1523,6 +1692,12 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
         .route("/datasets/extract", post(dataset_extract))
         .route("/datasets/{name}", get(dataset_detail).delete(dataset_delete))
         .route("/datasets/{name}/frames", get(dataset_frames))
+        // A captured frame is a base64 JPEG, so allow more than axum's 2 MB
+        // default JSON body.
+        .route(
+            "/datasets/{name}/capture",
+            post(dataset_capture).layer(DefaultBodyLimit::max(24 * 1024 * 1024)),
+        )
         .route("/datasets/{name}/image/{file}", get(dataset_image))
         .route(
             "/datasets/{name}/labels/{file}",

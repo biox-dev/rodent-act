@@ -340,6 +340,32 @@ export interface SplitReport {
   dataYaml: string;
 }
 
+/** `POST /api/datasets/{name}/capture` - add one frame from a job's player. */
+export interface CaptureFrameRequest {
+  /** `data:image/jpeg;base64,...` or bare base64. */
+  image: string;
+  /** YOLO boxes for this frame, normalised 0..1. */
+  boxes?: LabelBox[];
+  /** File-name prefix (default `frame`). */
+  prefix?: string;
+  /** Source frame index written into the file name. */
+  frame?: number;
+  /** Replace an existing image/label pair with the same name. */
+  overwrite?: boolean;
+}
+
+export interface CaptureFrameResponse {
+  dataset: DatasetSummary;
+  /** Stored image file name (`TST_000123.jpg`). */
+  image: string;
+  /** Stored label file name (`TST_000123.txt`). */
+  label: string;
+  boxes: number;
+  width: number;
+  height: number;
+  overwritten: boolean;
+}
+
 export interface CheckReport {
   root: string;
   scope: 'split' | 'raw';
@@ -426,6 +452,12 @@ export const api = {
       `/datasets/${encodeURIComponent(name)}/labels/${encodeURIComponent(file)}`,
       { method: 'PUT', body: JSON.stringify({ boxes }) },
     ),
+  /** Add one captured frame (JPEG + YOLO boxes) to an existing/new dataset. */
+  captureDatasetFrame: (name: string, body: CaptureFrameRequest) =>
+    request<CaptureFrameResponse>(`/datasets/${encodeURIComponent(name)}/capture`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   autolabelDataset: (name: string, opts: AutolabelOptions) =>
     request<{ report: AutolabelReport; dataset: DatasetSummary }>(
       `/datasets/${encodeURIComponent(name)}/autolabel`,

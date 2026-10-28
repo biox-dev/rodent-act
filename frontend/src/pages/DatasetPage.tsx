@@ -600,6 +600,8 @@ export default function DatasetPage() {
           </table>
         )}
         <div className="hint" style={{ marginTop: 10, fontSize: 11 }}>
+          补充样本：在任务视频页暂停到某一帧，点「加入训练集」即可把该帧画面与检测框直接写入所选数据集的
+          <code> raw/ </code>，适合把模型判错的帧补进训练集做 fine-tune。
           标注完成后在编辑器里点「划分训练/验证集」，会生成
           <code> images/labels/{'{train,val}'} </code> 和 <code>data.yaml</code>，
           可直接用于 <code>analytics/model_tools.py fine-tune</code> 或 Ultralytics 训练。
