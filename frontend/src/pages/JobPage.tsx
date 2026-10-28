@@ -321,34 +321,6 @@ export default function JobPage() {
               )}
             </div>
           )}
-
-          <h3 style={{ marginTop: 22 }}>
-            不动概率曲线
-            <span className="sub">
-              每窗口 p(immobile)，虚线=0.5 判定阈值{running && !live.complete ? ' · 实时增长' : ''}
-            </span>
-          </h3>
-          {hasWindows ? (
-            <SeriesChart
-              mode="prob"
-              windows={windows}
-              duration={clipDuration}
-              current={running ? undefined : Math.max(0, clipTime)}
-              hiddenTracks={hiddenTracks}
-              onToggleTrack={toggleTrack}
-              onShowAllTracks={showAllTracks}
-            />
-          ) : (
-            <div className="empty">
-              {running ? (
-                <>
-                  <span className="spinner" /> 分析进行中，窗口完成后即时绘制
-                </>
-              ) : (
-                '暂无窗口数据'
-              )}
-            </div>
-          )}
         </div>
       </div>
 
@@ -388,6 +360,34 @@ export default function JobPage() {
           ) : (
             <div className="empty">
               {running ? '分析进行中，窗口完成后即时绘制' : '暂无窗口数据'}
+            </div>
+          )}
+
+          <h3 style={{ marginTop: 22 }}>
+            不动概率曲线
+            <span className="sub">
+              每窗口 p(immobile)，虚线=0.5 判定阈值{running && !live.complete ? ' · 实时增长' : ''}
+            </span>
+          </h3>
+          {hasWindows ? (
+            <SeriesChart
+              mode="prob"
+              windows={windows}
+              duration={clipDuration}
+              current={running ? undefined : Math.max(0, clipTime)}
+              hiddenTracks={hiddenTracks}
+              onToggleTrack={toggleTrack}
+              onShowAllTracks={showAllTracks}
+            />
+          ) : (
+            <div className="empty">
+              {running ? (
+                <>
+                  <span className="spinner" /> 分析进行中，窗口完成后即时绘制
+                </>
+              ) : (
+                '暂无窗口数据'
+              )}
             </div>
           )}
 
