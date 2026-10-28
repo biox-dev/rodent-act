@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { ScoredWindow } from '../api';
 import { trackColor } from './TrackingOverlay';
 
@@ -15,9 +15,15 @@ const LANE_H = 24;
 
 /**
  * Per-track lane of 0.5 s windows: green = immobile, blue = mobile.
- * Clicking seeks the video to that window's midpoint.
+ * Hovering shows a vertical cursor, dragging scrubs, clicking seeks the video
+ * to that exact time.
  */
 export default function Timeline({ windows, duration, current, onSeek }: Props) {
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  // Time under the mouse (or the dragged cursor); null = no vertical line.
+  const [hoverT, setHoverT] = useState<number | null>(null);
+  const [dragging, setDragging] = useState(false);
+
   const lanes = useMemo(() => {
     const byTrack = new Map<number, ScoredWindow[]>();
     for (const w of windows) {
@@ -36,6 +42,43 @@ export default function Timeline({ windows, duration, current, onSeek }: Props) 
 
   const height = Math.min(LANE_H * lanes.length + 8, 220);
 
+  // Map a viewport x coordinate to a clip-relative time.
+  const timeAt = (clientX: number): number => {
+    const el = trackRef.current;
+    if (!el) return 0;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    const frac = (clientX - rect.left) / rect.width;
+    return Math.min(Math.max(frac, 0), 1) * span;
+  };
+
+  const handlePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setDragging(true);
+    const t = timeAt(e.clientX);
+    setHoverT(t);
+    onSeek(t);
+  };
+
+  const handlePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const t = timeAt(e.clientX);
+    setHoverT(t);
+    // While dragging, scrub the video in step with the cursor.
+    if (dragging) onSeek(t);
+  };
+
+  const handlePointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setDragging(false);
+  };
+
+  // Keep the time badge inside the lane strip: near the edges it anchors to
+  // the line instead of centring on it.
+  const hoverPct = hoverT !== null ? (hoverT / span) * 100 : null;
+  const hoverAnchor = hoverPct === null || hoverPct > 88 ? -100 : hoverPct < 12 ? 0 : -50;
+
   return (
     <div>
       <div className="timeline-row">
@@ -53,7 +96,22 @@ export default function Timeline({ windows, duration, current, onSeek }: Props) 
             </div>
           ))}
         </div>
-        <div className="timeline" style={{ height }}>
+        <div
+          ref={trackRef}
+          className="timeline"
+          style={{
+            height,
+            cursor: dragging ? 'grabbing' : 'crosshair',
+            touchAction: 'none',
+          }}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onPointerLeave={() => {
+            if (!dragging) setHoverT(null);
+          }}
+        >
           {lanes.map(([trackId, list], lane) => (
             <div
               key={trackId}
@@ -75,13 +133,19 @@ export default function Timeline({ windows, duration, current, onSeek }: Props) 
                       background: color,
                       opacity: trackId % 2 === 0 ? 0.95 : 0.8,
                     }}
-                    onClick={() => onSeek((w.start_t + w.end_t) / 2)}
                   />
                 );
               })}
             </div>
           ))}
           <div className="cursor" style={{ left: `${(current / span) * 100}%` }} />
+          {hoverPct !== null && (
+            <div className="hover-cursor" style={{ left: `${hoverPct}%` }}>
+              <span className="hover-time" style={{ transform: `translateX(${hoverAnchor}%)` }}>
+                {hoverT?.toFixed(2)}s
+              </span>
+            </div>
+          )}
         </div>
       </div>
       <div className="legend" style={{ marginTop: 8 }}>

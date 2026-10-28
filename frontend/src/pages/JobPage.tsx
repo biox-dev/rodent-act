@@ -215,7 +215,7 @@ export default function JobPage() {
         </div>
       )}
 
-      <div className="split">
+      <div>
         <div className="card">
           <h3>
             视频
@@ -281,43 +281,6 @@ export default function JobPage() {
                 </span>
               ) : (
                 <span className="muted">该帧无检测</span>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="card">
-          <h3>
-            窗口时间轴
-            <span className="sub">
-              点击色块跳转到该窗口
-              {running && hasWindows && ` · 实时累计 ${windows.length} 个窗口`}
-            </span>
-          </h3>
-          {hasWindows ? (
-            <>
-              <Timeline
-                windows={windows}
-                duration={clipDuration}
-                current={Math.max(0, Math.min(clipTime, clipDuration || clipTime))}
-                onSeek={seek}
-              />
-              {selectedWindow && (
-                <div className="muted mono" style={{ marginTop: 10 }}>
-                  track {selectedWindow.track_id} · {selectedWindow.start_t.toFixed(2)}–
-                  {selectedWindow.end_t.toFixed(2)}s · {selectedWindow.label} · p=
-                  {selectedWindow.immobile_prob.toFixed(3)}
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="empty">
-              {running ? (
-                <>
-                  <span className="spinner" /> 等待首个窗口 ({Math.round(progress.progress * 100)}%)
-                </>
-              ) : (
-                '暂无窗口数据'
               )}
             </div>
           )}
@@ -388,6 +351,41 @@ export default function JobPage() {
               {running ? (
                 <>
                   <span className="spinner" /> 分析进行中，窗口完成后即时绘制
+                </>
+              ) : (
+                '暂无窗口数据'
+              )}
+            </div>
+          )}
+
+          <h3 style={{ marginTop: 22 }}>
+            窗口时间轴
+            <span className="sub">
+              悬停显示时刻，拖动/点击定位视频
+              {running && hasWindows && ` · 实时累计 ${windows.length} 个窗口`}
+            </span>
+          </h3>
+          {hasWindows ? (
+            <>
+              <Timeline
+                windows={windows}
+                duration={clipDuration}
+                current={Math.max(0, Math.min(clipTime, clipDuration || clipTime))}
+                onSeek={seek}
+              />
+              {selectedWindow && (
+                <div className="muted mono" style={{ marginTop: 10 }}>
+                  track {selectedWindow.track_id} · {selectedWindow.start_t.toFixed(2)}–
+                  {selectedWindow.end_t.toFixed(2)}s · {selectedWindow.label} · p=
+                  {selectedWindow.immobile_prob.toFixed(3)}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="empty">
+              {running ? (
+                <>
+                  <span className="spinner" /> 等待首个窗口 ({Math.round(progress.progress * 100)}%)
                 </>
               ) : (
                 '暂无窗口数据'
