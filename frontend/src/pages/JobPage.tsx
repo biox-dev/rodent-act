@@ -468,7 +468,7 @@ export default function JobPage() {
                 {frameRecords && frameRecords.length > 0 ? (
                   <span className="mono">
                     {frameRecords
-                      .map((r) => `ID${r.track_id} p=${r.motion_energy.toFixed(2)}`)
+                      .map((r) => `M-${r.track_id} p=${r.motion_energy.toFixed(2)}`)
                       .join('  ')}
                   </span>
                 ) : (
@@ -569,7 +569,7 @@ export default function JobPage() {
                       }}
                       style={{ cursor: 'pointer' }}
                     >
-                      <td className="mono">{w.track_id}</td>
+                      <td className="mono">{`M-${w.track_id}`}</td>
                       <td className="num">{w.start_t.toFixed(2)}</td>
                       <td className="num">{w.end_t.toFixed(2)}</td>
                       <td className="num">{w.immobile_prob.toFixed(3)}</td>
@@ -701,7 +701,7 @@ export default function JobPage() {
               />
               {selectedWindow && (
                 <div className="muted mono" style={{ marginTop: 10 }}>
-                  track {selectedWindow.track_id} · {selectedWindow.start_t.toFixed(2)}–
+                  M-{selectedWindow.track_id} · {selectedWindow.start_t.toFixed(2)}–
                   {selectedWindow.end_t.toFixed(2)}s · {selectedWindow.label} · p=
                   {selectedWindow.immobile_prob.toFixed(3)}
                 </div>
@@ -759,7 +759,7 @@ export default function JobPage() {
                   <tbody>
                     {visiblePerTrack.map((t) => (
                       <tr key={t.track_id}>
-                        <td className="mono">ID {t.track_id}</td>
+                        <td className="mono">M-{t.track_id}</td>
                         <td>{t.n_windows}</td>
                         <td>{t.immobile_windows ?? '—'}</td>
                         <td>{t.mobile_windows ?? '—'}</td>

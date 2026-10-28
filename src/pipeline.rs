@@ -138,6 +138,85 @@ pub struct DetectionRecord {
     pub motion_energy: f32,
 }
 
+/// Renumber track ids so results read left-to-right (`M-1`, `M-2`, ...).
+///
+/// The tracker hands out ids in the order detections arrive, so the same
+/// animal can be `ID 3` in one run and `ID 1` in the next. Once a run is
+/// complete we know where every track actually spent its time: order the
+/// tracks by the median centre x of their own trajectory (ties broken by the
+/// median centre y, then by the original id) and renumber them `1..=n`.
+///
+/// This is naming only - box positions, scores and track boundaries are not
+/// touched. Returns the `old_id -> new_id` mapping.
+pub fn renumber_tracks_left_to_right(
+    records: &mut [DetectionRecord],
+    tracks: &mut [TrackSummary],
+) -> HashMap<usize, usize> {
+    let mut xs: HashMap<usize, Vec<f32>> = HashMap::new();
+    let mut ys: HashMap<usize, Vec<f32>> = HashMap::new();
+    for r in records.iter().filter(|r| r.measured) {
+        xs.entry(r.track_id).or_default().push((r.x1 + r.x2) * 0.5);
+        ys.entry(r.track_id).or_default().push((r.y1 + r.y2) * 0.5);
+    }
+
+    // Every id we know about: measured records first, then any summary entry
+    // without a measurement (should not happen, but must still get a slot).
+    let mut ids: Vec<usize> = xs.keys().copied().collect();
+    for t in tracks.iter() {
+        if !xs.contains_key(&t.id) {
+            ids.push(t.id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut order: Vec<(usize, f32, f32)> = ids
+        .into_iter()
+        .map(|id| {
+            let x = xs.get_mut(&id).map(|v| median(v)).unwrap_or(f32::INFINITY);
+            let y = ys.get_mut(&id).map(|v| median(v)).unwrap_or(f32::INFINITY);
+            (id, x, y)
+        })
+        .collect();
+    order.sort_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let map: HashMap<usize, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, (old, _, _))| (*old, i + 1))
+        .collect();
+
+    for r in records.iter_mut() {
+        if let Some(new) = map.get(&r.track_id) {
+            r.track_id = *new;
+        }
+    }
+    for t in tracks.iter_mut() {
+        if let Some(new) = map.get(&t.id) {
+            t.id = *new;
+        }
+    }
+    map
+}
+
+/// Median of a list of finite values (`INFINITY` when empty).
+fn median(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return f32::INFINITY;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        0.5 * (values[n / 2 - 1] + values[n / 2])
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RunInfo {
     pub input: String,
@@ -483,14 +562,31 @@ pub fn run_with_hook(
         // annotate whenever somebody is watching - not only when an mp4 is
         // being encoded. `preview_every` covers the CLI ASCII preview.
         if writer.is_some() || cfg.preview_every.is_some() || hook.is_some() {
+            // Live labels read left-to-right (`M-1` = leftmost animal *right
+            // now*). The stored results use the final, whole-run ordering
+            // (see `renumber_tracks_left_to_right`); both agree once every
+            // animal is on screen.
+            let mut by_x: Vec<(usize, f32)> = tracks
+                .iter()
+                .filter(|t| keep(t.class_id))
+                .map(|t| (t.id, t.bbox().center().0))
+                .collect();
+            by_x.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let mut rank: HashMap<usize, usize> = HashMap::new();
+            for (i, (id, _)) in by_x.iter().enumerate() {
+                rank.insert(*id, i + 1);
+            }
             let draws: Vec<DrawTrack> = tracks
                 .iter()
                 .filter(|t| keep(t.class_id))
-                .map(|t| DrawTrack {
-                    track: t,
-                    color: draw::id_color(t.id),
-                    label: format!("ID {} {:.2}", t.id, t.last_score),
-                    trail_len: 120,
+                .map(|t| {
+                    let name = rank.get(&t.id).copied().unwrap_or(t.id);
+                    DrawTrack {
+                        track: t,
+                        color: draw::id_color(name),
+                        label: format!("M-{} {:.2}", name, t.last_score),
+                        trail_len: 120,
+                    }
                 })
                 .collect();
             let overlay = FrameOverlay {
@@ -599,6 +695,18 @@ pub fn run_with_hook(
         info!("wrote {}", path.display());
     }
 
+    // Anchor the identity to the scene instead of to detection order: number
+    // the finished tracks left-to-right (M-1, M-2, ...). Everything downstream
+    // (records, windows, CSV, UI) then uses the same deterministic ids.
+    let mut tracks_out: Vec<TrackSummary> = summary.into_values().collect();
+    let renamed = renumber_tracks_left_to_right(&mut all_records, &mut tracks_out);
+    tracks_out.sort_by_key(|t| t.id);
+    info!(
+        tracks = tracks_out.len(),
+        renamed = renamed.len(),
+        "numbered tracks left-to-right (M-1..M-n)"
+    );
+
     let info_out = RunInfo {
         input: cfg.input.display().to_string(),
         width: w,
@@ -612,11 +720,7 @@ pub fn run_with_hook(
         detect_calls,
         detections: n_detections,
         device: active_device.to_string(),
-        tracks: {
-            let mut v: Vec<_> = summary.into_values().collect();
-            v.sort_by_key(|t| t.id);
-            v
-        },
+        tracks: tracks_out,
         records: all_records,
     };
 
@@ -1454,5 +1558,66 @@ mod tests {
         assert!((d.immobile_s - 1.0).abs() < 1e-9);
         assert!((d.covered_s - 1.0).abs() < 1e-9);
         assert!((d.longest_immobile_s - 0.5).abs() < 1e-9);
+    }
+
+    fn rec(track_id: usize, cx: f32, cy: f32) -> DetectionRecord {
+        DetectionRecord {
+            frame: 0,
+            track_id,
+            x1: cx - 10.0,
+            y1: cy - 10.0,
+            x2: cx + 10.0,
+            y2: cy + 10.0,
+            score: 1.0,
+            measured: true,
+            motion_energy: 0.0,
+        }
+    }
+
+    fn summary(id: usize) -> TrackSummary {
+        TrackSummary {
+            id,
+            class_id: 0,
+            start_frame: 0,
+            end_frame: 100,
+            n_points: 101,
+            n_measured: 101,
+        }
+    }
+
+    #[test]
+    fn renumbers_tracks_left_to_right() {
+        // Detection order gave the rightmost animal id 1 and the leftmost id 3.
+        let mut records = vec![
+            rec(1, 420.0, 100.0),
+            rec(1, 424.0, 100.0),
+            rec(2, 220.0, 100.0),
+            rec(3, 60.0, 100.0),
+        ];
+        let mut tracks = vec![summary(1), summary(2), summary(3)];
+
+        let map = renumber_tracks_left_to_right(&mut records, &mut tracks);
+
+        assert_eq!(map[&3], 1, "leftmost track becomes M-1");
+        assert_eq!(map[&2], 2);
+        assert_eq!(map[&1], 3, "rightmost track becomes M-3");
+        assert_eq!(
+            records.iter().map(|r| r.track_id).collect::<Vec<_>>(),
+            vec![3, 3, 2, 1]
+        );
+        tracks.sort_by_key(|t| t.id);
+        assert_eq!(tracks.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn renumber_ties_break_top_to_bottom() {
+        // Same x (stacked pens): the upper track is numbered first.
+        let mut records = vec![rec(7, 100.0, 300.0), rec(9, 100.0, 50.0)];
+        let mut tracks = vec![summary(7), summary(9)];
+
+        renumber_tracks_left_to_right(&mut records, &mut tracks);
+
+        assert_eq!(records[0].track_id, 2);
+        assert_eq!(records[1].track_id, 1);
     }
 }

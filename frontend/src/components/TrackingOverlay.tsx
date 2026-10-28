@@ -62,7 +62,7 @@ export function TrackingOverlay({ records, videoWidth, videoHeight, visible }: P
         ctx.globalAlpha = r.measured ? 1 : 0.45;
         ctx.strokeRect(x, y, w, h);
 
-        const label = `ID ${r.track_id} ${r.score.toFixed(2)}`;
+        const label = `M-${r.track_id} ${r.score.toFixed(2)}`;
         const textW = ctx.measureText(label).width + 8;
         ctx.globalAlpha = 0.85;
         ctx.fillStyle = color;

@@ -468,7 +468,7 @@ fn print_analysis(report: &pipeline::AnalyzeReport) {
     );
     for s in &report.per_track_stats {
         println!(
-            "  track {}: immobile {}/{} ({:.1}%, {:.2}s, longest {:.2}s), mobile {} ({:.2}s), \
+            "  M-{}: immobile {}/{} ({:.1}%, {:.2}s, longest {:.2}s), mobile {} ({:.2}s), \
              covered {:.2}s",
             s.track_id,
             s.immobile_windows,
