@@ -88,7 +88,6 @@ struct MediaFile {
     size: u64,
     modified_ms: u64,
 }
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -578,6 +577,7 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         total_frames: std::sync::RwLock::new(0),
         run: std::sync::RwLock::new(None),
         report: std::sync::RwLock::new(None),
+        analyze: std::sync::RwLock::new(analyze_cfg.clone()),
         windows: std::sync::RwLock::new(Vec::new()),
         feature_names: std::sync::RwLock::new(
             crate::features::FEATURE_NAMES
@@ -654,6 +654,83 @@ async fn cancel_job(State(st): State<AppState>, UrlPath(id): UrlPath<String>) ->
         let _ = job.finished.send(true);
     }
     Json(job.view()).into_response()
+}
+
+/// `POST /api/jobs/{id}/rescore` parameters.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescoreJob {
+    /// Window length in seconds (omitted = keep the job's current value).
+    #[serde(default)]
+    pub window: Option<f64>,
+    /// Window stride in seconds (omitted = keep the job's current value).
+    #[serde(default)]
+    pub stride: Option<f64>,
+    /// XGBoost model path; `""` falls back to the speed baseline, `null` or
+    /// omitted keeps the model used by the previous run.
+    #[serde(default)]
+    pub clf: Option<String>,
+}
+
+/// Re-score the windows of a finished job from its stored tracking records.
+///
+/// No ffmpeg, no detection, no tracking: only feature extraction and the
+/// classifier run, so changing `window` / `stride` / model costs milliseconds
+/// instead of re-analysing the whole video.
+async fn rescore_job(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Json(req): Json<RescoreJob>,
+) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+    if !job.status().is_terminal() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "job is still running - wait for it to finish (or cancel it) first",
+        );
+    }
+
+    let current = job.analyze.read().map(|g| g.clone()).unwrap_or_default();
+    let window = req.window.unwrap_or(current.window_s).clamp(0.1, 10.0);
+    let stride = req.stride.unwrap_or(current.stride_s).max(0.05);
+    let classifier = match req.clf {
+        Some(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| PathBuf::from(s))
+        }
+        None => current.classifier.clone(),
+    };
+    let cfg = AnalyzeConfig {
+        classifier,
+        window_s: window,
+        stride_s: stride,
+    };
+
+    let worker = job.clone();
+    let csv_path = job.dir.join("windows.csv");
+    let result =
+        tokio::task::spawn_blocking(move || state::rescore(&worker, &cfg, &csv_path)).await;
+    match result {
+        Ok(Ok(report)) => {
+            let r = &*report;
+            Json(serde_json::json!({
+                "feature_names": &r.feature_names,
+                "n_windows": r.windows.len(),
+                "mean_immobile_prob": r.mean_immobile_prob,
+                "per_track_immobile_fraction": &r.per_track_immobile_fraction,
+                "windows": &r.windows,
+                "job": job.view(),
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rescore task failed: {e}"),
+        ),
+    }
 }
 
 /// Per-frame tracking records (boxes for every frame of every track).
@@ -1442,6 +1519,7 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs/{id}/rescore", post(rescore_job))
         .route("/jobs/{id}/events", get(job_events))
         .route("/jobs/{id}/frame", get(latest_frame))
         .route("/jobs/{id}/frames", get(frame_stream))

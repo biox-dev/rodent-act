@@ -33,6 +33,14 @@ export default function JobPage() {
   const [currentTime, setCurrentTime] = useState(0);
   const [selectedWindow, setSelectedWindow] = useState<ScoredWindow | null>(null);
   const [speedFeature, setSpeedFeature] = useState('speed_mean');
+  // Re-score form: seeded from the job's current settings once it loads, so it
+  // shows what produced the numbers on screen.
+  const [rWindow, setRWindow] = useState('');
+  const [rStride, setRStride] = useState('');
+  const [rClf, setRClf] = useState('');
+  const [rescoring, setRescoring] = useState(false);
+  const [rescoreError, setRescoreError] = useState<string | null>(null);
+  const seededSettings = useRef(false);
   // One track filter for both charts, so hiding a track in the probability
   // curve also hides it in the feature curve. Empty set = show everything.
   const [hiddenTracks, setHiddenTracks] = useState<ReadonlySet<number>>(() => new Set());
@@ -94,6 +102,17 @@ export default function JobPage() {
     return () => window.clearInterval(timer);
   }, [done, refresh]);
 
+  // Seed the re-score inputs exactly once, so the 5 s status refresh never
+  // overwrites what the user is typing.
+  useEffect(() => {
+    if (seededSettings.current || !job) return;
+    seededSettings.current = true;
+    const w = job.window_s > 0 ? job.window_s : 0.5;
+    setRWindow(String(w));
+    setRStride(String(job.stride_s > 0 ? job.stride_s : w * 0.5));
+    setRClf(job.clf ?? '');
+  }, [job]);
+
   const speedIndex = useMemo(() => {
     const i = live.featureNames.indexOf(speedFeature);
     return i >= 0 ? i : 0;
@@ -111,10 +130,32 @@ export default function JobPage() {
     return out;
   }, [liveLogs]);
 
+  // Re-score the windows only: the backend reuses the saved tracking result
+  // (`tracking.json`), so this returns in milliseconds instead of re-decoding
+  // and re-detecting the whole video.
+  const applyRescore = async () => {
+    if (!id) return;
+    setRescoring(true);
+    setRescoreError(null);
+    try {
+      const w = Number(rWindow);
+      const s = Number(rStride);
+      await api.rescore(id, {
+        window: Number.isFinite(w) && w > 0 ? w : undefined,
+        stride: Number.isFinite(s) && s > 0 ? s : undefined,
+        clf: rClf.trim(),
+      });
+      await Promise.all([refresh(), live.reload()]);
+    } catch (e) {
+      setRescoreError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRescoring(false);
+    }
+  };
+
   if (!id) return null;
 
-  return (
-    <div className="page">
+  return (    <div className="page">
       <div className="card">
 
 
@@ -213,6 +254,67 @@ export default function JobPage() {
                 原 {job.summary.source_duration_s.toFixed(1)}s
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {job && !running && (
+        <div className="card">
+          <h3>
+            参数重算
+            <span className="sub">
+              只重算窗口特征与分类，不重新解码/检测视频（通常 1 秒内完成）
+            </span>
+          </h3>
+          <div className="row">
+            <label className="field">
+              窗口长度 (s)
+              <input
+                type="number"
+                step={0.1}
+                min={0.1}
+                value={rWindow}
+                onChange={(e) => setRWindow(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              步长 stride (s)
+              <input
+                type="number"
+                step={0.05}
+                min={0.05}
+                value={rStride}
+                onChange={(e) => setRStride(e.target.value)}
+              />
+              <span className="hint">等于窗口长度 = 不重叠（如窗口 0.5 / 步长 0.5）</span>
+            </label>
+            <label className="field" style={{ minWidth: 240 }}>
+              XGBoost 模型（留空 = 速度基线）
+              <input
+                placeholder="例如 models/clf.json"
+                value={rClf}
+                onChange={(e) => setRClf(e.target.value)}
+              />
+            </label>
+            <div className="field" style={{ alignSelf: 'flex-start', minWidth: 'auto' }}>
+              <button onClick={() => void applyRescore()} disabled={rescoring}>
+                {rescoring ? (
+                  <>
+                    <span className="spinner" />
+                    重算中…
+                  </>
+                ) : (
+                  '应用并重算'
+                )}
+              </button>
+            </div>
+          </div>
+          {rescoreError && <div className="error-box">{rescoreError}</div>}
+          <div className="hint" style={{ marginTop: 8, fontSize: 11 }}>
+            当前：窗口 {job.window_s}s / 步长 {job.stride_s}s
+            {job.clf ? ` · 模型 ${job.clf}` : ' · 速度阈值基线'}。重算只更新窗口特征、
+            不动概率、时间轴与统计，视频与检测框不变；结果会覆盖本任务的 windows.csv /
+            report.json。
           </div>
         </div>
       )}

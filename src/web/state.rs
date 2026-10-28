@@ -205,6 +205,9 @@ pub struct Job {
     /// Tracking records, available as soon as the tracking pass finishes.
     pub run: RwLock<Option<Arc<RunInfo>>>,
     pub report: RwLock<Option<Arc<AnalyzeReport>>>,
+    /// Window/stride/classifier that produced `report`. Kept on the job so the
+    /// UI can show the current settings and re-score without re-tracking.
+    pub analyze: RwLock<pipeline::AnalyzeConfig>,
     /// Windows scored so far, growing while the job runs (live curve/table).
     pub windows: RwLock<Vec<ScoredWindow>>,
     pub feature_names: RwLock<Vec<String>>,
@@ -234,6 +237,11 @@ impl Job {
     /// The part of a job that is persisted as `job.json`.
     pub fn meta(&self) -> JobMeta {
         let clip = self.clip;
+        let analyze = self
+            .analyze
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         JobMeta {
             id: self.id.clone(),
             input: self.input.display().to_string(),
@@ -245,6 +253,12 @@ impl Job {
             error: self.error.read().unwrap_or_else(|e| e.into_inner()).clone(),
             duration_s: *self.duration_s.read().unwrap_or_else(|e| e.into_inner()),
             has_video: self.video.read().map(|v| v.is_some()).unwrap_or(false),
+            window_s: analyze.window_s,
+            stride_s: Some(analyze.stride_s),
+            clf: analyze
+                .classifier
+                .as_ref()
+                .map(|p| p.display().to_string()),
         }
     }
 
@@ -282,6 +296,20 @@ pub struct JobMeta {
     pub duration_s: Option<f64>,
     #[serde(default)]
     pub has_video: bool,
+    /// Window length used for the stored report (seconds).
+    #[serde(default = "default_window_s")]
+    pub window_s: f64,
+    /// Window stride used for the stored report (seconds).
+    #[serde(default)]
+    pub stride_s: Option<f64>,
+    /// XGBoost model used for the stored report.
+    #[serde(default)]
+    pub clf: Option<String>,
+}
+
+/// Default window length for jobs whose `job.json` predates the field.
+fn default_window_s() -> f64 {
+    crate::features::DEFAULT_WINDOW_S
 }
 
 /// Write JSON through a temp file, so a crash can never leave a truncated
@@ -332,6 +360,12 @@ pub struct JobView {
     pub progress: f64,
     pub duration_s: Option<f64>,
     pub has_video: bool,
+    /// Window length currently used for scoring (seconds).
+    pub window_s: f64,
+    /// Window stride currently used for scoring (seconds).
+    pub stride_s: f64,
+    /// XGBoost model in use (`null` = speed-threshold baseline).
+    pub clf: Option<String>,
     pub summary: Option<SummaryView>,
 }
 
@@ -454,6 +488,11 @@ impl Job {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let analyze = self
+            .analyze
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         // Live stats: the summary is derived from whatever has been scored so
         // far, so the header tiles update while the job is still running and
         // are identical to the final report once `report` is set.
@@ -487,6 +526,12 @@ impl Job {
             progress,
             duration_s: *self.duration_s.read().unwrap_or_else(|e| e.into_inner()),
             has_video: self.video.read().map(|v| v.is_some()).unwrap_or(false),
+            window_s: analyze.window_s,
+            stride_s: analyze.stride_s,
+            clf: analyze
+                .classifier
+                .as_ref()
+                .map(|p| p.display().to_string()),
             summary,
         }
     }
@@ -620,6 +665,11 @@ impl JobManager {
         let video_path = dir.join("annotated.mp4");
         let video = (meta.has_video && video_path.is_file()).then_some(video_path);
         let (finished_tx, _) = watch::channel(meta.status.is_terminal());
+        let window_s = if meta.window_s > 0.0 {
+            meta.window_s
+        } else {
+            crate::features::DEFAULT_WINDOW_S
+        };
         Job {
             id: meta.id,
             input: PathBuf::from(meta.input),
@@ -633,6 +683,11 @@ impl JobManager {
             total_frames: RwLock::new(frames),
             run: RwLock::new(run),
             report: RwLock::new(report),
+            analyze: RwLock::new(pipeline::AnalyzeConfig {
+                classifier: meta.clf.map(PathBuf::from),
+                window_s,
+                stride_s: meta.stride_s.unwrap_or(window_s * 0.5).max(0.05),
+            }),
             windows: RwLock::new(windows),
             feature_names: RwLock::new(
                 crate::features::FEATURE_NAMES
@@ -728,6 +783,9 @@ pub fn execute(
 ) -> Result<CompletedRun> {
     let started = Instant::now();
     job.set_status(JobStatus::Running);
+    if let Ok(mut g) = job.analyze.write() {
+        *g = analyze_cfg.clone();
+    }
     let frames = job.frames.clone();
     let cancel = job.cancel_flag();
     let progress_job = job.clone();
@@ -862,6 +920,65 @@ pub fn execute(
         "analysis job finished"
     );
     Ok(CompletedRun { run, report, video })
+}
+
+/// Re-score the windows of an already-tracked job.
+///
+/// Window scoring only needs the per-frame tracking records ([`RunInfo`]), which
+/// live in memory and are persisted as `tracking.json`. Changing the window
+/// length, the stride or the classifier therefore never decodes the video
+/// again: detection and tracking results are reused verbatim, only the feature
+/// extraction + classification pass runs (milliseconds instead of minutes).
+///
+/// The new report replaces `windows.csv` and `report.json` in the job directory,
+/// so a server restart keeps the re-scored numbers.
+pub fn rescore(
+    job: &Arc<Job>,
+    cfg: &pipeline::AnalyzeConfig,
+    csv_path: &Path,
+) -> Result<Arc<AnalyzeReport>> {
+    let run = job
+        .run
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .or_else(|| read_json::<RunInfo>(&job.dir.join("tracking.json")).map(Arc::new));
+    let Some(run) = run else {
+        return Err(anyhow::anyhow!(
+            "job has no tracking result yet (wait for the tracking pass to finish)"
+        ));
+    };
+
+    let report = Arc::new(pipeline::score_tracks(&run, cfg).context("window scoring")?);
+
+    if let Ok(mut g) = job.windows.write() {
+        *g = report.windows.clone();
+    }
+    if let Ok(mut g) = job.feature_names.write() {
+        *g = report.feature_names.clone();
+    }
+    if let Ok(mut g) = job.report.write() {
+        *g = Some(report.clone());
+    }
+    if let Ok(mut g) = job.analyze.write() {
+        *g = cfg.clone();
+    }
+
+    pipeline::write_window_csv(csv_path, &report.feature_names, &report.windows)
+        .context("rewriting windows.csv")?;
+    if let Err(e) = write_json_atomic(&job.dir.join("report.json"), &*report) {
+        tracing::warn!(job = %job.id, error = %e, "cannot persist window report");
+    }
+    // Remember the new settings so the UI shows them after a restart too.
+    job.save_meta();
+    tracing::info!(
+        job = %job.id,
+        window_s = cfg.window_s,
+        stride_s = cfg.stride_s,
+        windows = report.windows.len(),
+        "re-scored windows from the existing tracking result"
+    );
+    Ok(report)
 }
 
 /// Fail a job and notify subscribers.

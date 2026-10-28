@@ -69,6 +69,12 @@ export interface JobView {
   progress: number;
   duration_s: number | null;
   has_video: boolean;
+  /** Window length currently used for scoring (seconds). */
+  window_s: number;
+  /** Window stride currently used for scoring (seconds). */
+  stride_s: number;
+  /** XGBoost model in use (`null` = speed-threshold baseline). */
+  clf: string | null;
   summary: SummaryView | null;
 }
 
@@ -147,6 +153,25 @@ export interface LogsResponse {
   total: number;
   next: number;
   records: LogRecord[];
+}
+
+/** `POST /api/jobs/{id}/rescore` - re-score from the stored tracking result. */
+export interface RescoreRequest {
+  /** Window length in seconds (omit = keep the job's current value). */
+  window?: number;
+  /** Window stride in seconds (omit = keep the job's current value). */
+  stride?: number;
+  /** XGBoost model path; `''` falls back to the speed baseline. */
+  clf?: string;
+}
+
+export interface RescoreResponse {
+  feature_names: string[];
+  n_windows: number;
+  mean_immobile_prob: number;
+  per_track_immobile_fraction: [number, number][];
+  windows: ScoredWindow[];
+  job: JobView;
 }
 
 export interface CreateJobRequest {
@@ -325,6 +350,12 @@ export const api = {
   createJob: (body: CreateJobRequest) =>
     request<JobView>('/jobs', { method: 'POST', body: JSON.stringify(body) }),
   cancelJob: (id: string) => request<JobView>(`/jobs/${id}/cancel`, { method: 'POST' }),
+  /** Recompute the windows only - the video is not analysed again. */
+  rescore: (id: string, body: RescoreRequest) =>
+    request<RescoreResponse>(`/jobs/${id}/rescore`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   records: (id: string) => request<RecordsResponse>(`/jobs/${id}/records`),
   windows: (id: string) => request<WindowsResponse>(`/jobs/${id}/windows`),
   logs: (id: string, since = 0) => request<LogsResponse>(`/jobs/${id}/logs?since=${since}`),

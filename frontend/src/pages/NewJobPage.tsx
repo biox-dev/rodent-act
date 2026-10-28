@@ -39,6 +39,7 @@ export default function NewJobPage() {
   const [className, setClassName] = useState('any');
   const [scoreThr, setScoreThr] = useState(0.2);
   const [window, setWindowS] = useState(0.5);
+  const [stride, setStride] = useState('');
   const [clf, setClf] = useState('');
   const [writeVideo, setWriteVideo] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -142,6 +143,7 @@ export default function NewJobPage() {
       scoreThr: detector === 'yolo' ? scoreThr : undefined,
       model: detector === 'yolo' ? model || undefined : undefined,
       window,
+      stride: stride ? Number(stride) : undefined,
       clf: clf || undefined,
       writeVideo,
     };
@@ -486,7 +488,9 @@ export default function NewJobPage() {
       <div className="card">
         <h3>
           4. 窗口与分类
-          <span className="sub">默认 0.5 s 窗口 / 50% 重叠，无模型时使用速度阈值基线</span>
+          <span className="sub">
+            默认 0.5 s 窗口 / 50% 重叠（stride = 窗口一半），无模型时使用速度阈值基线
+          </span>
         </h3>
         <div className="row">
           <label className="field">
@@ -499,8 +503,23 @@ export default function NewJobPage() {
               onChange={(e) => setWindowS(Number(e.target.value))}
             />
             <span className="hint">
-              把轨迹切成固定时长的小段，每段单独判定不动/活动。步长固定为窗口的一半
-              （50% 重叠），因此 0.5 s 窗口每 0.25 s 产出一个结果。TST 标准通常取 0.5 s。
+              把轨迹切成固定时长的小段，每段单独判定不动/活动。TST 标准通常取 0.5 s。
+              窗口长度与步长都可在任务完成后调整重算，无需重新分析视频。
+            </span>
+          </label>
+          <label className="field">
+            步长 stride (s)
+            <input
+              type="number"
+              step={0.05}
+              min={0.05}
+              placeholder={`默认 ${(window / 2).toFixed(2)}（窗口一半）`}
+              value={stride}
+              onChange={(e) => setStride(e.target.value)}
+            />
+            <span className="hint">
+              相邻窗口起点的时间间隔。留空 = 窗口的一半（50% 重叠）；
+              填成与窗口相同（如 0.5 / 0.5）即<b>不重叠</b>，窗口数减半、结果更“整段化”。
             </span>
           </label>
           <label className="field" style={{ minWidth: 240 }}>

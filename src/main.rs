@@ -246,6 +246,33 @@ enum Command {
         annotate: bool,
     },
 
+    /// Re-score windows from an existing tracking JSON (no video decoding).
+    ///
+    /// Only feature extraction + classification run, so `--window` / `--stride`
+    /// / `--clf` can be explored without re-running detection and tracking.
+    Rescore {
+        /// JSON written by `track --json` (or `out/web/<job>/tracking.json`).
+        #[arg(long)]
+        json: PathBuf,
+
+        /// Where to write the per-window CSV (features + prediction).
+        #[arg(long, default_value = "out/windows.csv")]
+        windows: PathBuf,
+
+        /// Optional XGBoost JSON model. Without it a speed-threshold baseline
+        /// is used.
+        #[arg(long)]
+        clf: Option<PathBuf>,
+
+        /// Window length in seconds.
+        #[arg(long, default_value_t = 0.5)]
+        window: f64,
+
+        /// Window stride in seconds (defaults to half the window => 50 % overlap).
+        #[arg(long)]
+        stride: Option<f64>,
+    },
+
     /// Start the web UI (Axum API + React frontend) for interactive analysis.
     Serve {
         /// Address to bind (0.0.0.0 listens on all interfaces).
@@ -605,6 +632,39 @@ fn main() -> anyhow::Result<()> {
                 stride_s: stride.unwrap_or(window * 0.5),
             };
             let report = pipeline::analyze(&track, &analyze_cfg)?;
+            pipeline::write_window_csv(&windows, &report.feature_names, &report.windows)?;
+            println!(
+                "tracks={} windows={} immobile_windows={} mean_immobile_prob={:.3}",
+                report.n_tracks,
+                report.windows.len(),
+                report
+                    .windows
+                    .iter()
+                    .filter(|w| w.label == classify::ActClass::Immobile)
+                    .count(),
+                report.mean_immobile_prob
+            );
+            for (id, frac) in &report.per_track_immobile_fraction {
+                println!("  track {id}: immobile {:.1}%", frac * 100.0);
+            }
+        }
+        Command::Rescore {
+            json,
+            windows,
+            clf,
+            window,
+            stride,
+        } => {
+            let file = std::fs::File::open(&json)
+                .map_err(|e| anyhow::anyhow!("opening {}: {e}", json.display()))?;
+            let info: pipeline::RunInfo = serde_json::from_reader(std::io::BufReader::new(file))
+                .map_err(|e| anyhow::anyhow!("parsing {}: {e}", json.display()))?;
+            let analyze_cfg = pipeline::AnalyzeConfig {
+                classifier: clf,
+                window_s: window,
+                stride_s: stride.unwrap_or(window * 0.5),
+            };
+            let report = pipeline::score_tracks(&info, &analyze_cfg)?;
             pipeline::write_window_csv(&windows, &report.feature_names, &report.windows)?;
             println!(
                 "tracks={} windows={} immobile_windows={} mean_immobile_prob={:.3}",

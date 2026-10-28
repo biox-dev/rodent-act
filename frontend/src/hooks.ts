@@ -263,7 +263,9 @@ export function useLiveWindows(jobId: string | undefined, active: boolean) {
     };
   }, [jobId, active, load, merge]);
 
-  return state;
+  // `reload` lets the caller re-fetch the snapshot after an action that changes
+  // the scored windows (e.g. re-scoring with a new window/stride).
+  return { ...state, reload: load };
 }
 
 /** Load tracking records (per-frame boxes) once the tracking pass is done. */

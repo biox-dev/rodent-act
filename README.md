@@ -311,6 +311,7 @@ cd frontend && npm run dev              # 终端 B：Vite :5173，/api 自动代
 | `POST` | `/jobs` | 创建任务 `{"media": "...", "startS": 10, "endS": 40, "detector": "blob", "reference": "empty_ref.png", ...}`（`startS`/`endS` 为源视频秒数，省略即整段） |
 | `GET` | `/jobs` / `/jobs/{id}` | 任务列表 / 详情（含 summary） |
 | `POST` | `/jobs/{id}/cancel` | 取消运行中的任务 |
+| `POST` | `/jobs/{id}/rescore` | **只重算窗口**（不重新分析视频）：`{"window":0.5,"stride":0.5,"clf":""}`，复用任务的 `tracking.json`，覆盖 `windows.csv` / `report.json` |
 | `GET` | `/jobs/{id}/events` | **SSE**：`log` / `progress` / `status` / `done` |
 | `GET` | `/jobs/{id}/frames` | **SSE**：标注帧，`data` 为 base64 JPEG |
 | `GET` | `/jobs/{id}/frame` | 最新一帧 JPEG（`204` = 还没有帧） |
@@ -453,6 +454,32 @@ Rust 侧自带 XGBoost JSON 推理器（`src/classify.rs`），无需 `libxgboos
 `out/windows.csv` 列：`track_id, start_frame, end_frame, start_t, end_t,
 immobile_prob, label, rii` + 18 个特征。`rii` 是文献里的经典判据
 （0.5 s 内位移 < 1 px 的帧占比），便于与已发表结果对照。
+
+### 5.3 只改窗口参数：不必重新分析视频
+
+窗口打分只依赖逐帧追踪记录（`frame` + 框 + `motion_energy`），不需要再解码视频。
+所以调 `--window` / `--stride` / `--clf` 时可以**复用已经算好的追踪结果**，
+只跑特征提取 + 分类（毫秒级）：
+
+```bash
+# 复用 `track --json` 的结果，只重算窗口
+./target/release/rodent-act rescore \
+  --json out/tracks.json --windows out/windows_0505.csv \
+  --window 0.5 --stride 0.5
+
+# Web 任务的结果同样可复用（tracking.json 就在任务目录里）
+./target/release/rodent-act rescore \
+  --json out/web/<job>/tracking.json --windows out/windows.csv \
+  --window 0.5 --stride 0.5 --clf models/tst_clf.json
+```
+
+`--stride` 省略时等于窗口的一半（50 % 重叠）；`--stride` 等于 `--window` 即**不重叠**。
+窗口与步长都会按帧数取整（0.5 s @ 25 fps = 13 帧），因此 0.5/0.5 的窗口数约为
+0.5/0.25 的一半。
+
+Web UI 也可以：任务详情页的「参数重算」卡片里改窗口长度 / 步长 / 模型，点
+「应用并重算」即可 —— 同样不重新解码视频，并覆盖该任务的
+`windows.csv` 与 `report.json`。（等价于 `POST /api/jobs/{id}/rescore`。）
 
 ---
 
