@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { Badge, Tabs } from 'antd';
+import { Badge, Segmented, Tabs } from 'antd';
 import { api, type LabelBox, type LogRecord, type ScoredWindow } from '../api';
 import AddFrameToDataset, { type CapturedFrame } from '../components/AddFrameToDataset';
 import SeriesChart from '../components/SeriesChart';
@@ -20,10 +20,16 @@ function pct(v: number | undefined | null): string {
   return `${(v * 100).toFixed(1)}%`;
 }
 
-/** Seconds -> `12.3s` / `1m05.2s`, for the per-track duration columns. */
-function fmtDur(v: number | undefined | null): string {
+/**
+ * Duration formatting for the per-track duration columns.
+ * `clock` -> `12.3s` / `1m05.2s`, `seconds` -> always `65.2s`.
+ */
+function fmtDur(
+  v: number | undefined | null,
+  mode: 'clock' | 'seconds' = 'clock',
+): string {
   if (v === undefined || v === null || Number.isNaN(v)) return '—';
-  if (v < 60) return `${v.toFixed(1)}s`;
+  if (mode === 'seconds' || v < 60) return `${v.toFixed(1)}s`;
   const m = Math.floor(v / 60);
   return `${m}m${(v - m * 60).toFixed(1)}s`;
 }
@@ -57,6 +63,24 @@ export default function JobPage() {
   // One track filter for both charts, so hiding a track in the probability
   // curve also hides it in the feature curve. Empty set = show everything.
   const [hiddenTracks, setHiddenTracks] = useState<ReadonlySet<number>>(() => new Set());
+  // Unit for the per-track duration columns: keep the readable `1m05.2s` form
+  // or show plain seconds so columns can be compared/summed at a glance.
+  const [durMode, setDurMode] = useState<'clock' | 'seconds'>(() => {
+    try {
+      const saved = window.localStorage.getItem('rodent.durMode');
+      return saved === 'seconds' ? 'seconds' : 'clock';
+    } catch {
+      return 'clock';
+    }
+  });
+  const changeDurMode = useCallback((mode: 'clock' | 'seconds') => {
+    setDurMode(mode);
+    try {
+      window.localStorage.setItem('rodent.durMode', mode);
+    } catch {
+      // private mode / storage disabled: the toggle still works for this visit
+    }
+  }, []);
   const toggleTrack = useCallback((trackId: number) => {
     setHiddenTracks((prev) => {
       const next = new Set(prev);
@@ -721,16 +745,44 @@ export default function JobPage() {
 
           {job?.summary && job.summary.per_track.length > 0 && (
             <>
-              <h3 style={{ marginTop: 20 }}>
-                每条轨迹的窗口统计
-                <span className="sub">
-                  共 {job.summary.n_tracks} 条
-                  {hiddenTracks.size > 0 && `（显示 ${visiblePerTrack.length} 条）`}，均值{' '}
-                  {pct(job.summary.mean_immobile_prob)}，阈值 p(imm)={(
-                    job.threshold ?? 0.5
-                  ).toFixed(2)}
-                </span>
-              </h3>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: 8,
+                  marginTop: 20,
+                  marginBottom: 12,
+                }}
+              >
+                <h3 style={{ margin: 0 }}>
+                  每条轨迹的窗口统计
+                  <span className="sub">
+                    共 {job.summary.n_tracks} 条
+                    {hiddenTracks.size > 0 && `（显示 ${visiblePerTrack.length} 条）`}，均值{' '}
+                    {pct(job.summary.mean_immobile_prob)}，阈值 p(imm)={(
+                      job.threshold ?? 0.5
+                    ).toFixed(2)}
+                  </span>
+                </h3>
+                <label
+                  className="muted"
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
+                  title="切换时长列的显示单位"
+                >
+                  时长单位
+                  <Segmented
+                    size="small"
+                    value={durMode}
+                    onChange={(v) => changeDurMode(v as 'clock' | 'seconds')}
+                    options={[
+                      { label: '分:秒', value: 'clock' },
+                      { label: '秒', value: 'seconds' },
+                    ]}
+                  />
+                </label>
+              </div>
               <TrackFilter
                 trackIds={perTrackIds}
                 hiddenTracks={hiddenTracks}
@@ -764,10 +816,10 @@ export default function JobPage() {
                         <td>{t.immobile_windows ?? '—'}</td>
                         <td>{t.mobile_windows ?? '—'}</td>
                         <td>{pct(t.immobile_fraction)}</td>
-                        <td className="num">{fmtDur(t.immobile_s)}</td>
-                        <td className="num">{fmtDur(t.mobile_s)}</td>
-                        <td className="num">{fmtDur(t.longest_immobile_s)}</td>
-                        <td className="num">{fmtDur(t.longest_mobile_s)}</td>
+                        <td className="num">{fmtDur(t.immobile_s, durMode)}</td>
+                        <td className="num">{fmtDur(t.mobile_s, durMode)}</td>
+                        <td className="num">{fmtDur(t.longest_immobile_s, durMode)}</td>
+                        <td className="num">{fmtDur(t.longest_mobile_s, durMode)}</td>
                         <td>
                           <div className="progress">
                             <div style={{ width: `${Math.round(t.immobile_fraction * 100)}%` }} />
