@@ -2,6 +2,12 @@
     // Use IntelliSense to learn about possible attributes.
     // Hover to view descriptions of existing attributes.
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    //
+    // `ort` 以 load-dynamic 方式链接：ONNX Runtime 在**运行时**才加载，必须先用
+    // ORT_DYLIB_PATH 指向 libonnxruntime.so，否则 yolo 后端、`serve` 默认模型，
+    // 以及所有 examples 都会报 `failed to load dynamic library`。
+    // launch.json 不做 shell 展开，所以用 ${workspaceFolder} 拼绝对路径；
+    // cwd 固定为仓库根目录（models/、media/、out/ 都按 CWD 解析）。
     "version": "0.2.0",
     "configurations": [
 
@@ -13,6 +19,10 @@
                 "args": [
                     "test"
                 ]
+            },
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
             }
         },
         {
@@ -25,7 +35,11 @@
                     "--bin=rodent-act"
                 ]
             },
-            "args": []
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
+            }
         },
         {
             // 调试 Web 服务（Axum）：等价于终端里的
@@ -63,6 +77,10 @@
                     "test",
                     "--bin=rodent-act"
                 ]
+            },
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
             }
         },
         {
@@ -75,7 +93,11 @@
                     "--example=debug_blob"
                 ]
             },
-            "args": []
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
+            }
         },
         {
             "name": "Debug unit tests in example 'debug_blob'",
@@ -86,9 +108,15 @@
                     "test",
                     "--example=debug_blob"
                 ]
+            },
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
             }
         },
         {
+            // 用法：在 args 里按 <video> <frame> <score_thr> [model.onnx] 填，
+            // 例如 ["media/TST.mp4", "40", "0.01", "models/mouse.onnx"]。
             "name": "Debug example 'debug_detect'",
             "type": "lldb",
             "request": "launch",
@@ -98,7 +126,12 @@
                     "--example=debug_detect"
                 ]
             },
-            "args": []
+            "args": [],
+            // debug_detect 用相对路径读 media/ 与 models/、写 out/。
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
+            }
         },
         {
             "name": "Debug unit tests in example 'debug_detect'",
@@ -109,6 +142,10 @@
                     "test",
                     "--example=debug_detect"
                 ]
+            },
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
             }
         },
         {
@@ -121,7 +158,11 @@
                     "--example=tmp_two_loads"
                 ]
             },
-            "args": []
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
+            }
         },
         {
             "name": "Debug unit tests in example 'tmp_two_loads'",
@@ -132,6 +173,10 @@
                     "test",
                     "--example=tmp_two_loads"
                 ]
+            },
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so"
             }
         }
     ]

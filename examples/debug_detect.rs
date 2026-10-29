@@ -10,13 +10,13 @@ use rodent_act::debug_api::*;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let video = args.get(1).cloned().unwrap_or_else(|| "media/synthetic_mice.mp4".into());
+    let video = args.get(1).cloned().unwrap_or_else(|| "media/TST.mp4".into());
     let frame_idx: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(40);
     let score_thr: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.01);
     let model = args
         .get(4)
         .cloned()
-        .unwrap_or_else(|| "models/yolo11n.onnx".into());
+        .unwrap_or_else(|| "models/mouse.onnx".into());
 
     let mut reader = video_io::VideoReader::open(std::path::Path::new(&video), 640)?;
     let f = reader.skip_to(frame_idx)?.expect("frame not found");
