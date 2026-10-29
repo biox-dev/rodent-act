@@ -1,0 +1,138 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Debug unit tests in library 'rodent_act'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'rodent-act'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=rodent-act"
+                ]
+            },
+            "args": []
+        },
+        {
+            // 调试 Web 服务（Axum）：等价于终端里的
+            //   export ORT_DYLIB_PATH="$PWD/models/libonnxruntime.so"
+            //   cargo run --bin=rodent-act -- serve
+            // `ort` 以 load-dynamic 编译，运行时靠 ORT_DYLIB_PATH 定位
+            // libonnxruntime.so；launch.json 里不做 shell 展开，所以用
+            // ${workspaceFolder} 拼绝对路径。
+            "name": "Debug server (rodent-act serve)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=rodent-act"
+                ]
+            },
+            "args": [
+                "serve"
+            ],
+            // 必须从仓库根目录启动：models/ 与 media/ 都按 CWD 解析。
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "ORT_DYLIB_PATH": "${workspaceFolder}/models/libonnxruntime.so",
+                // debug 级别会进 SSE 日志流（serve 装了 telemetry 层）。
+                "RUST_LOG": "debug,ort=warn"
+            }
+        },
+        {
+            "name": "Debug unit tests in executable 'rodent-act'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=rodent-act"
+                ]
+            }
+        },
+        {
+            "name": "Debug example 'debug_blob'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--example=debug_blob"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in example 'debug_blob'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--example=debug_blob"
+                ]
+            }
+        },
+        {
+            "name": "Debug example 'debug_detect'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--example=debug_detect"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in example 'debug_detect'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--example=debug_detect"
+                ]
+            }
+        },
+        {
+            "name": "Debug example 'tmp_two_loads'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--example=tmp_two_loads"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in example 'tmp_two_loads'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--example=tmp_two_loads"
+                ]
+            }
+        }
+    ]
+}

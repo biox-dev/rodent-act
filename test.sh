@@ -13,7 +13,11 @@
 #
 # 运行：  bash test.sh
 
-cd /home/admin/workspace/rodent-act
+# 脚本所在目录即仓库根目录（后面所有路径都相对它），这样才能用 $PWD 拼路径
+cd "$(dirname "$0")"
+
+# ONNX Runtime 动态库：`ort` 用 load-dynamic 编译，运行时靠这个变量定位
+export ORT_DYLIB_PATH="$PWD/models/libonnxruntime.so"
 
 
 # ============================================================ 1. 编译 ======
@@ -109,7 +113,8 @@ else
 
   # 跑完整 8 秒（200 帧）。CPU 上 YOLO 约 8 fps，这一步需要 ~25 秒。
   # 想快速看链路是否通，临时改成 --max-frames 60（只处理前 2.4 秒）。
-  ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act track \
+  # ORT_DYLIB_PATH 已在脚本开头 export。
+  ./target/release/rodent-act track \
     -i media/synthetic_mice.mp4 \
     --detector yolo \
     --model "$YOLO_ONNX" \
@@ -124,7 +129,7 @@ else
 fi
 
 
-ORT_DYLIB_PATH=models/libonnxruntime.so ./target/release/rodent-act track \
+./target/release/rodent-act track \
     -i TST.mp4 \
     --detector yolo \
     --model "$YOLO_ONNX" \

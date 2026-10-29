@@ -611,6 +611,15 @@ cargo run --example debug_blob   -- media/x.mp4 40 22                 # 打印 b
 改了前端后必须**重新 `cargo build`** 才会进二进制（`build.rs` 监听
 `frontend/dist` 的变更）；日常调 UI 可用 `--frontend` 或 Vite dev server 热更新。
 
+调试服务器：VS Code 调试面板里选 **Debug server (rodent-act serve)**
+（`.vscode/launch.json`，已设置 `ORT_DYLIB_PATH=${workspaceFolder}/models/libonnxruntime.so`
+和 `RUST_LOG=debug`）；终端等价命令：
+
+```bash
+bash debug.sh                            # 内部 export ORT_DYLIB_PATH="$PWD/models/libonnxruntime.so"
+bash debug.sh --addr 127.0.0.1:9000      # 其余参数原样传给 serve
+```
+
 调试开关：`RUST_LOG=debug`、`--show-rois`、`--preview-every 25`（终端 ASCII 预览）。
 
 ### 已知问题 / 注意
