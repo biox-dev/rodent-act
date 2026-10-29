@@ -433,6 +433,16 @@ export const api = {
   createJob: (body: CreateJobRequest) =>
     request<JobView>('/jobs', { method: 'POST', body: JSON.stringify(body) }),
   cancelJob: (id: string) => request<JobView>(`/jobs/${id}/cancel`, { method: 'POST' }),
+  /**
+   * Analyse the same video again from scratch with the job's stored settings
+   * (`POST /api/jobs/{id}/rerun`). A **new** job is created and returned; the
+   * current one is left untouched. `overrides` replace single settings.
+   */
+  rerun: (id: string, overrides: Partial<CreateJobRequest> = {}) =>
+    request<JobView>(`/jobs/${id}/rerun`, {
+      method: 'POST',
+      body: JSON.stringify(overrides),
+    }),
   /** Recompute the windows only - the video is not analysed again. */
   rescore: (id: string, body: RescoreRequest) =>
     request<RescoreResponse>(`/jobs/${id}/rescore`, {

@@ -197,6 +197,10 @@ pub struct Job {
     /// restart-recovery files (`job.json`, `tracking.json`, `report.json`)
     /// are written.
     pub dir: PathBuf,
+    /// The `POST /api/jobs` payload that started this job, replayed by
+    /// `POST /api/jobs/{id}/rerun`. `None` for jobs created before it was
+    /// persisted (the rerun endpoint then falls back to the job header).
+    pub request: Option<serde_json::Value>,
     pub status: RwLock<JobStatus>,
     pub error: RwLock<Option<String>>,
     pub created_ms: u64,
@@ -260,6 +264,7 @@ impl Job {
                 .classifier
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            request: self.request.clone(),
         }
     }
 
@@ -309,6 +314,9 @@ pub struct JobMeta {
     /// XGBoost model used for the stored report.
     #[serde(default)]
     pub clf: Option<String>,
+    /// Original `POST /api/jobs` payload, replayed by the rerun endpoint.
+    #[serde(default)]
+    pub request: Option<serde_json::Value>,
 }
 
 /// Default window length for jobs whose `job.json` predates the field.
@@ -752,6 +760,7 @@ impl JobManager {
             input_name: meta.input_name,
             clip,
             dir: dir.to_path_buf(),
+            request: meta.request.clone(),
             status: RwLock::new(meta.status),
             error: RwLock::new(meta.error),
             created_ms: meta.created_ms,

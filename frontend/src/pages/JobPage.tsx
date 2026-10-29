@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import { Badge, Segmented, Tabs } from 'antd';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Badge, Popconfirm, Segmented, Tabs } from 'antd';
 import { api, type LabelBox, type LogRecord, type ScoredWindow } from '../api';
 import AddFrameToDataset, { type CapturedFrame } from '../components/AddFrameToDataset';
 import SeriesChart from '../components/SeriesChart';
@@ -36,6 +36,7 @@ function fmtDur(
 
 export default function JobPage() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const { job, progress, liveLogs, refresh } = useJobEvents(id);
   const running = !!job && !isTerminal(job.status);
   const frames = useFrameStream(id, running);
@@ -59,6 +60,10 @@ export default function JobPage() {
   const [rClf, setRClf] = useState('');
   const [rescoring, setRescoring] = useState(false);
   const [rescoreError, setRescoreError] = useState<string | null>(null);
+  // "Re-analyse the video": replays the stored job settings through the full
+  // pipeline (decode + detect + track + score) into a brand new job.
+  const [rerunning, setRerunning] = useState(false);
+  const [rerunError, setRerunError] = useState<string | null>(null);
   const seededSettings = useRef(false);
   // One track filter for both charts, so hiding a track in the probability
   // curve also hides it in the feature curve. Empty set = show everything.
@@ -253,6 +258,20 @@ export default function JobPage() {
 
   if (!id) return null;
 
+  // Full re-analysis: the backend replays this job's stored request, so the
+  // new job uses exactly the same video, clip and detector settings.
+  const rerunAnalysis = async (jobId: string) => {
+    setRerunning(true);
+    setRerunError(null);
+    try {
+      const next = await api.rerun(jobId);
+      navigate(`/jobs/${next.id}`);
+    } catch (e) {
+      setRerunError(e instanceof Error ? e.message : String(e));
+      setRerunning(false);
+    }
+  };
+
   return (    <div className="page">
       <div className="card">
 
@@ -279,6 +298,32 @@ export default function JobPage() {
                 <button className="ghost">下载标注视频</button>
               </a>
             )}
+            {job && (
+              <Popconfirm
+                title="重新分析视频"
+                description={
+                  <span style={{ display: 'inline-block', maxWidth: 280 }}>
+                    用与本次相同的参数（视频、分析区间、检测器、模型、跟踪与评分设置）
+                    重新跑一遍完整流程。会创建一个新任务，当前任务及其结果保留不变。
+                  </span>
+                }
+                okText="开始分析"
+                cancelText="取消"
+                onConfirm={() => void rerunAnalysis(job.id)}
+                disabled={rerunning}
+              >
+                <button className="ghost" disabled={rerunning}>
+                  {rerunning ? (
+                    <>
+                      <span className="spinner" />
+                      创建中…
+                    </>
+                  ) : (
+                    '重新分析'
+                  )}
+                </button>
+              </Popconfirm>
+            )}
             {running && (
               <button className="danger" onClick={() => void api.cancelJob(id).then(refresh)}>
                 取消
@@ -304,6 +349,11 @@ export default function JobPage() {
         )}
 
         {job?.error && <div className="error-box" style={{ marginTop: 12 }}>{job.error}</div>}
+        {rerunError && (
+          <div className="error-box" style={{ marginTop: 12 }}>
+            重新分析失败: {rerunError}
+          </div>
+        )}
       </div>
 
       {job?.summary && (

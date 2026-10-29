@@ -36,7 +36,9 @@ pub struct AppState {
 // request / response DTOs
 // --------------------------------------------------------------------------- //
 
-#[derive(Debug, Deserialize)]
+/// `POST /api/jobs` payload. Also persisted verbatim in `job.json` so
+/// `POST /api/jobs/{id}/rerun` can replay the exact same analysis settings.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateJob {
     /// File name inside the media directory (see `/api/media`).
@@ -376,6 +378,16 @@ fn parse_range(value: &str) -> Option<(u64, u64)> {
 }
 
 async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> Response {
+    start_job(&st, req).await
+}
+
+/// Shared body of `POST /api/jobs` and `POST /api/jobs/{id}/rerun`.
+///
+/// The payload is stored verbatim next to the job so the same analysis can be
+/// replayed later (see [`rerun_job`]).
+async fn start_job(st: &AppState, req: CreateJob) -> Response {
+    // Persisted before `req` is taken apart into the pipeline configs below.
+    let request = serde_json::to_value(&req).ok();
     let Some(input) = safe_join(st.jobs.media_dir(), &req.media) else {
         return api_error(StatusCode::BAD_REQUEST, "invalid media name");
     };
@@ -578,6 +590,7 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
         input,
         clip,
         dir: job_dir.clone(),
+        request,
         status: std::sync::RwLock::new(JobStatus::Queued),
         error: std::sync::RwLock::new(None),
         created_ms: now_ms(),
@@ -632,6 +645,74 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<CreateJob>) -> R
 
     tracing::info!(job = %job_id, media = %req.media, "analysis job queued");
     (StatusCode::CREATED, Json(job.view())).into_response()
+}
+
+/// `POST /api/jobs/{id}/rerun` - analyse the same video again, from scratch.
+///
+/// The payload stored with the job is replayed unchanged (same media file,
+/// clip, detector, model, tracker and scoring settings). Any field present in
+/// the request body overrides it, so the UI can re-run with a tweak without
+/// filling in the whole form. A **new** job is created - the original job and
+/// its artifacts are left untouched - and its `JobView` is returned so the
+/// caller can jump straight to the live progress.
+async fn rerun_job(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(job) = st.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown job");
+    };
+
+    // Jobs written by older builds carry no payload; the header fields are
+    // still enough to replay the analysis (the other settings fall back to the
+    // defaults `POST /api/jobs` uses).
+    let mut base = job.request.clone().unwrap_or_else(|| {
+        let analyze = job.analyze.read().map(|g| g.clone()).unwrap_or_default();
+        serde_json::json!({
+            "media": job.input_name,
+            "startS": job.clip.map(|c| c.start_s).unwrap_or(0.0),
+            "endS": job.clip.and_then(|c| c.end_s),
+            "window": analyze.window_s,
+            "stride": analyze.stride_s,
+            "threshold": analyze.threshold,
+            "clf": analyze.classifier.map(|p| p.display().to_string()),
+            "writeVideo": job.video.read().map(|v| v.is_some()).unwrap_or(false),
+        })
+    });
+
+    if !body.is_empty() {
+        let overrides = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(serde_json::Value::Object(m)) => m,
+            Ok(_) => {
+                return api_error(StatusCode::BAD_REQUEST, "rerun body must be a JSON object");
+            }
+            Err(e) => {
+                return api_error(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}"));
+            }
+        };
+        if let Some(map) = base.as_object_mut() {
+            for (key, value) in overrides {
+                // `null` means "keep the stored value": the UI submits a partial
+                // form where cleared fields must not wipe the original setting.
+                if !value.is_null() {
+                    map.insert(key, value);
+                }
+            }
+        }
+    }
+
+    let req: CreateJob = match serde_json::from_value(base) {
+        Ok(r) => r,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("stored job settings cannot be replayed: {e}"),
+            );
+        }
+    };
+    tracing::info!(job = %id, media = %req.media, "re-running analysis with the stored settings");
+    start_job(&st, req).await
 }
 
 fn rand_suffix() -> u16 {
@@ -1768,6 +1849,7 @@ pub fn router(state: AppState, frontend_dist: Option<&Path>) -> Router {
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs/{id}/rerun", post(rerun_job))
         .route("/jobs/{id}/rescore", post(rescore_job))
         .route("/jobs/{id}/events", get(job_events))
         .route("/jobs/{id}/frame", get(latest_frame))

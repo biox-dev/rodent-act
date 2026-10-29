@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api, type JobView } from '../api';
 
 function fmtDuration(s: number | null): string {
@@ -13,9 +13,26 @@ function fmtTime(ms: number): string {
 }
 
 export default function JobsPage() {
+  const navigate = useNavigate();
   const [jobs, setJobs] = useState<JobView[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // Job whose re-analysis request is in flight (one at a time is enough).
+  const [rerunningId, setRerunningId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  /** Re-analyse a job's video from scratch (same settings, new job). */
+  const rerun = async (id: string) => {
+    setRerunningId(id);
+    setActionError(null);
+    try {
+      const next = await api.rerun(id);
+      navigate(`/jobs/${next.id}`);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+      setRerunningId(null);
+    }
+  };
 
   useEffect(() => {
     let alive = true;
@@ -51,6 +68,7 @@ export default function JobsPage() {
         </div>
         <div style={{ marginTop: 14 }}>
           {error && <div className="error-box">无法获取任务列表: {error}</div>}
+          {actionError && <div className="error-box">重新分析失败: {actionError}</div>}
           {!error && loading && <div className="empty">加载中…</div>}
           {!error && !loading && jobs.length === 0 && (
             <div className="empty">还没有任务，先创建一个分析。</div>
@@ -68,6 +86,7 @@ export default function JobsPage() {
                   <th>不动比例</th>
                   <th>耗时</th>
                   <th>创建时间</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -99,6 +118,23 @@ export default function JobsPage() {
                       </td>
                       <td>{fmtDuration(j.duration_s)}</td>
                       <td className="muted">{fmtTime(j.created_ms)}</td>
+                      <td>
+                        <button
+                          className="ghost"
+                          disabled={rerunningId !== null}
+                          title="用与本次相同的参数重新分析视频（生成新任务，不覆盖当前结果）"
+                          onClick={() => void rerun(j.id)}
+                        >
+                          {rerunningId === j.id ? (
+                            <>
+                              <span className="spinner" />
+                              创建中…
+                            </>
+                          ) : (
+                            '重新分析'
+                          )}
+                        </button>
+                      </td>
                     </tr>
                   );
                 })}
